@@ -1,0 +1,17 @@
+{
+  "name": "deepseek-mirror",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DeepSeek 镜像站 · 自建 DeepSeek Chat 镜像服务，逆向前端 SPA 与私有 API 协议，以账号池 + WASM PoW 求解直连上游，无需官方 API Key。实验性项目。 / Self-hosted DeepSeek Chat mirror. Reverse-engineers the frontend SPA and private API protocol, uses account pool + WASM PoW solving to connect upstream — no official API key required. Experimental.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^4.18.2",
+    "express-session": "^1.17.3",
+    "http-proxy-middleware": "^2.0.6",
+    "sql.js": "^1.14.1"
+  }
+}

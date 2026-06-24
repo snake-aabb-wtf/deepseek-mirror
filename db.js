@@ -18,7 +18,7 @@ const { encryptToken, decryptToken, looksEncrypted } = require('./lib/crypto');
 const { createLogger } = require('./lib/logger');
 const logger = createLogger('db');
 
-const DB_PATH = path.join(__dirname, 'sessions.db');
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'sessions.db');
 const OLD_DB_PATH = path.join(__dirname, 'sessions.db.old');  // 迁移后保留原文件
 
 let db = null;

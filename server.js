@@ -317,6 +317,11 @@ function getAccountByIndex(idx) {
   return null;
 }
 
+// 取当前 session userId（无则用 mirror-user）
+function uid(req) {
+  return (req.session && req.session.userId) || 'mirror-user';
+}
+
 app.delete('/admin/api/accounts/:index', adminLimiter, adminAuth, (req, res) => {
   const acct = getAccountByIndex(parseInt(req.params.index));
   if (acct) {
@@ -434,7 +439,7 @@ app.get('/api/v0/current', (req, res) => {
 // ---- Mock chat endpoints ----
 
 app.post('/api/v0/chat_session/create', (req, res) => {
-  const session = db.createSession();
+  const session = db.createSession(undefined, uid(req));
   res.json({
     data: {
       biz_data: {
@@ -463,7 +468,7 @@ app.get('/api/v0/chat_session/fetch_page', (req, res) => {
     cursor.value = parseInt(req.query['lte_cursor.updated_at']);
   }
   const count = req.query.count ? parseInt(req.query.count) : 20;
-  const result = db.fetchPage(cursor, count);
+  const result = db.fetchPage(cursor, count, uid(req));
   res.json({
     data: {
       biz_data: {
@@ -479,7 +484,7 @@ app.post('/api/v0/chat_session/update_title', (req, res) => {
   if (!chat_session_id) {
     return res.json({ data: { biz_code: 1, biz_data: {}, biz_msg: 'missing id' } });
   }
-  const updatedAt = db.updateTitle(chat_session_id, title || '');
+  const updatedAt = db.updateTitle(chat_session_id, title || '', uid(req));
   res.json({
     data: {
       biz_code: 0,
@@ -494,12 +499,12 @@ app.post('/api/v0/chat_session/update_title', (req, res) => {
 
 app.post('/api/v0/chat_session/delete', (req, res) => {
   const { chat_session_id } = req.body;
-  if (chat_session_id) db.deleteSession(chat_session_id);
+  if (chat_session_id) db.deleteSession(chat_session_id, uid(req));
   res.json({ data: { biz_code: 0 } });
 });
 
 app.post('/api/v0/chat_session/delete_all', (req, res) => {
-  db.deleteAllSessions();
+  db.deleteAllSessions(uid(req));
   res.json({ data: { biz_code: 0 } });
 });
 
@@ -508,7 +513,7 @@ app.post('/api/v0/chat_session/update_pinned', (req, res) => {
   if (!chat_session_id) {
     return res.json({ data: { biz_code: 1 } });
   }
-  const updatedAt = db.updatePinned(chat_session_id, !!pinned);
+  const updatedAt = db.updatePinned(chat_session_id, !!pinned, uid(req));
   res.json({
     data: {
       biz_code: 0,
@@ -532,8 +537,8 @@ app.get('/api/v0/chat/history_messages', (req, res) => {
   if (!sessionId) {
     return res.json({ data: { biz_data: { chat_session: null, chat_messages: [] } } });
   }
-  const session = db.getSession(sessionId);
-  const messages = db.getMessages(sessionId);
+  const session = db.getSession(sessionId, uid(req));
+  const messages = db.getMessages(sessionId, uid(req));
   res.json({
     data: {
       biz_data: {
@@ -614,26 +619,27 @@ async function handleDeepSeekCompletion(req, res, mode) {
   }
 
   // Ensure chat session exists in DB
+  const userId = uid(req);
   if (chat_session_id) {
-    const existing = db.getSession(chat_session_id);
+    const existing = db.getSession(chat_session_id, userId);
     if (!existing) {
-      db.createSession(chat_session_id);
+      db.createSession(chat_session_id, userId);
     }
   }
 
   // For regenerate: remove last assistant message from DB
   if (mode === 'regenerate') {
-    db.deleteLastMessageByRole(chat_session_id, 'assistant');
+    db.deleteLastMessageByRole(chat_session_id, 'assistant', userId);
   }
 
   // For edit_message: remove last assistant + last user from DB
   if (mode === 'edit_message') {
-    db.deleteLastMessageByRole(chat_session_id, 'assistant');
-    db.deleteLastMessageByRole(chat_session_id, 'user');
+    db.deleteLastMessageByRole(chat_session_id, 'assistant', userId);
+    db.deleteLastMessageByRole(chat_session_id, 'user', userId);
   }
 
   // Store user message in DB
-  db.addMessage(chat_session_id, { role: 'user', content: prompt, id: crypto.randomUUID() });
+  db.addMessage(chat_session_id, { role: 'user', content: prompt, id: crypto.randomUUID() }, userId);
 
   // Set SSE headers
   res.setHeader('Content-Type', 'text/event-stream');
@@ -691,7 +697,7 @@ async function handleDeepSeekCompletion(req, res, mode) {
     }
 
     // Store the response message
-    db.addMessage(chat_session_id, { role: 'assistant', content: fullContent, id: responseMessageId });
+    db.addMessage(chat_session_id, { role: 'assistant', content: fullContent, id: responseMessageId }, userId);
 
     recordStat(true, Date.now() - startTime);
     sendDeepSeekSSE(res, 'finish', {});

@@ -265,9 +265,22 @@ function verifyPassword(user, password) {
   const parts = user.password_hash.split(':');
   if (parts.length !== 2) return false;
   const salt = parts[0];
-  const hash = parts[1];
-  const computedHash = crypto.scryptSync(password, salt, 64).toString('hex');
-  return computedHash === hash;
+  const hashHex = parts[1];
+  // [PR-0.9] 用 timingSafeEqual 防时序攻击
+  let computed;
+  try {
+    computed = crypto.scryptSync(password, salt, 64);
+  } catch {
+    return false;
+  }
+  let stored;
+  try {
+    stored = Buffer.from(hashHex, 'hex');
+  } catch {
+    return false;
+  }
+  if (stored.length !== computed.length) return false;
+  return crypto.timingSafeEqual(computed, stored);
 }
 
 function getUserCount() {

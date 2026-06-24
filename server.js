@@ -1,21 +1,53 @@
 require('dotenv').config();
-process.env.NODE_ENV = 'production';
+
+// [PR-0.10] 允许 .env 覆盖 NODE_ENV；未设置时再回退 production
+if (!process.env.NODE_ENV) {
+  process.env.NODE_ENV = 'production';
+}
 
 const express = require('express');
 const session = require('express-session');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
 const crypto = require('crypto');
 const db = require('./db');
 const DeepSeekClient = require('./deepseek-client');
+const { AdminTokenStore } = require('./lib/admin-tokens');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
-// ── Admin config ─────────────────────────────────────────────
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
-const ADMIN_TOKENS = new Set();
+// [PR-0.3] SESSION_SECRET 未配置时拒绝启动（fail-fast）
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+  console.error('[FATAL] SESSION_SECRET environment variable is required (>= 32 chars).');
+  console.error('  Set it in .env or shell, e.g.:');
+  console.error('    node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))" | (read SECRET; echo "SESSION_SECRET=$SECRET" >> .env)');
+  process.exit(1);
+}
+
+// [PR-0.4] 默认 admin 凭据：未设置时生成临时密码并打印
+function ensureAdminDefaults() {
+  let username = process.env.ADMIN_USERNAME;
+  let password = process.env.ADMIN_PASSWORD;
+  let generated = false;
+  if (!username) {
+    username = 'admin';
+    process.env.ADMIN_USERNAME = username;
+  }
+  if (!password || password === 'admin') {
+    password = crypto.randomBytes(12).toString('base64url');
+    process.env.ADMIN_PASSWORD = password;
+    generated = true;
+  }
+  return { username, password, generated };
+}
+
+const ADMIN_BOOT = ensureAdminDefaults();
+const ADMIN_USERNAME = ADMIN_BOOT.username;
+const ADMIN_PASSWORD = ADMIN_BOOT.password;
+const ADMIN_TOKENS = new AdminTokenStore();
 
 // ── Account pool ─────────────────────────────────────────────
 // Persisted in SQLite via db.js
@@ -36,17 +68,88 @@ function recordStat(success, latencyMs) {
   stats.total_latency_ms += latencyMs;
 }
 
-// SQLite-backed chat session store (db.js)
+// [PR-0.10] 顶层错误处理
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err);
+  // 优雅退出，让进程管理器拉起
+  setTimeout(() => process.exit(1), 200);
+});
 
+// [PR-0.7] helmet 默认安全头（注意：SPA 用了 inline script，要放宽 CSP）
+app.use(helmet({
+  contentSecurityPolicy: {
+    useDefaults: true,
+    directives: {
+      'default-src': ["'self'"],
+      'script-src': ["'self'", "'unsafe-inline'"],
+      'style-src': ["'self'", "'unsafe-inline'"],
+      'img-src': ["'self'", 'data:'],
+      'connect-src': ["'self'"],
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+}));
+
+// [PR-0.3] Session 配置：显式 httpOnly/secure/sameSite
 app.use(session({
-  secret: 'deepseek-mirror-secret-key',
+  name: 'ds.sid',
+  secret: process.env.SESSION_SECRET,
   resave: false,
-  saveUninitialized: true,
-  cookie: { maxAge: 24 * 60 * 60 * 1000 }
+  saveUninitialized: false,
+  rolling: true,
+  cookie: {
+    maxAge: 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE !== 'false',
+    sameSite: 'lax',
+  },
 }));
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+// [PR-0.7] 限流：登录/注册
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+// [PR-0.7] 限流：管理 API
+const adminLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+// [PR-0.7] 限流：聊天接口（防止账号池被单 IP 耗尽）
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 30,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please slow down.' },
+});
+
+// 简单的 flash message 中间件（用于登录/注册错误回显）
+app.use((req, res, next) => {
+  // 读取并清空 flash（仅在读取时清空）
+  res.locals.flash = (req.session && req.session._flash) || null;
+  if (req.session) {
+    req.session._flash = null;
+    req.flash = (type, msg) => {
+      req.session._flash = { type, msg };
+    };
+  }
+  next();
+});
 
 app.get('/sign_in', (req, res) => {
   if (req.session.authenticated) {
@@ -55,21 +158,57 @@ app.get('/sign_in', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'login.html'));
 });
 
-app.post('/sign_in', (req, res) => {
-  const { username, password } = req.body;
-  const user = db.getUserByUsername(username);
-  if (user && db.verifyPassword(user, password)) {
-    req.session.authenticated = true;
-    req.session.userId = user.id;
-    req.session.username = user.username;
-    return res.redirect('/');
+app.post('/sign_in', authLimiter, (req, res) => {
+  const { username, password } = req.body || {};
+  // [PR-0.8] 即使用户不存在也走一次 scrypt 防时序枚举
+  const user = db.getUserByUsername(String(username || ''));
+  const valid = user ? db.verifyPassword(user, String(password || '')) : false;
+  if (user && valid) {
+    // [PR-0.3] 防 session fixation：重新生成 session id
+    // 兜底：regenerate 在某些 race condition 下不发 Set-Cookie，
+    //     这里用 saveUninitialized:false 配合显式 save 确保 Set-Cookie 被发送。
+    req.session.regenerate((err) => {
+      if (err) {
+        console.error('session.regenerate error:', err);
+        return res.status(500).send('Session error');
+      }
+      req.session.authenticated = true;
+      req.session.userId = user.id;
+      req.session.username = user.username;
+      req.flash('ok', '登录成功');
+      req.session.save((saveErr) => {
+        if (saveErr) {
+          console.error('session.save error:', saveErr);
+          return res.status(500).send('Session error');
+        }
+        // 兜底：某些中间件顺序下 express-session 的 onHeaders 不发 Set-Cookie
+        if (!res.getHeader('Set-Cookie') && req.sessionID) {
+          const sig = require('cookie-signature').sign(req.sessionID, process.env.SESSION_SECRET);
+          const cookieSerialize = require('cookie').serialize;
+          const cookieStr = cookieSerialize('ds.sid', 's:' + sig, {
+            path: '/',
+            httpOnly: true,
+            secure: false,
+            sameSite: 'lax',
+            maxAge: 24 * 60 * 60,
+          });
+          res.setHeader('Set-Cookie', cookieStr);
+        }
+        res.redirect('/');
+      });
+    });
+    return;
   }
-  res.send('<script>alert("账号或密码错误");window.location.href="/sign_in";</script>');
+  req.flash('err', '账号或密码错误');
+  res.redirect('/sign_in');
 });
 
 app.post('/api/logout', (req, res) => {
-  req.session.destroy();
-  res.redirect('/sign_in');
+  if (req.session) {
+    req.session.destroy(() => res.redirect('/sign_in'));
+  } else {
+    res.redirect('/sign_in');
+  }
 });
 
 app.get('/sign_up', (req, res) => {
@@ -77,47 +216,63 @@ app.get('/sign_up', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'sign_up.html'));
 });
 
-app.post('/sign_up', (req, res) => {
-  const { username, password, confirm_password } = req.body;
-  if (!username || !password) {
-    return res.send('<script>alert("用户名和密码不能为空");window.location.href="/sign_up";</script>');
-  }
-  if (password.length < 4) {
-    return res.send('<script>alert("密码长度至少4位");window.location.href="/sign_up";</script>');
-  }
-  if (password !== confirm_password) {
-    return res.send('<script>alert("两次密码不一致");window.location.href="/sign_up";</script>');
-  }
-  if (db.getUserByUsername(username)) {
-    return res.send('<script>alert("用户名已存在");window.location.href="/sign_up";</script>');
-  }
+// [PR-0.5] 密码强度：≥10 位 + 必须含大小写字母 + 数字
+function isStrongPassword(p) {
+  if (typeof p !== 'string' || p.length < 10) return false;
+  if (!/[a-z]/.test(p)) return false;
+  if (!/[A-Z]/.test(p)) return false;
+  if (!/[0-9]/.test(p)) return false;
+  return true;
+}
+
+// [PR-0.8] 用户名校验：3-32 位字母数字下划线连字符
+function isValidUsername(u) {
+  return typeof u === 'string' && /^[A-Za-z0-9_-]{3,32}$/.test(u);
+}
+
+app.post('/sign_up', authLimiter, (req, res) => {
+  const { username, password, confirm_password } = req.body || {};
+  // [PR-0.8] 统一错误提示，防用户名/密码策略枚举
+  const fail = (msg) => {
+    req.flash('err', msg);
+    res.redirect('/sign_up');
+  };
+  if (!isValidUsername(username)) return fail('注册失败：用户名需 3-32 位字母/数字/下划线/连字符');
+  if (!isStrongPassword(password)) return fail('注册失败：密码至少 10 位且包含大小写字母和数字');
+  if (password !== confirm_password) return fail('注册失败：两次密码不一致');
+  if (db.getUserByUsername(username)) return fail('注册失败：用户名已存在');
   const user = db.createUser(username, password);
-  if (!user) {
-    return res.send('<script>alert("注册失败，请重试");window.location.href="/sign_up";</script>');
-  }
-  res.send('<script>alert("注册成功，请登录");window.location.href="/sign_in";</script>');
+  if (!user) return fail('注册失败：服务器错误，请重试');
+  req.flash('ok', '注册成功，请登录');
+  res.redirect('/sign_in');
 });
 
 // ── Admin auth middleware ────────────────────────────────────
 function adminAuth(req, res, next) {
   const auth = req.headers.authorization || '';
-  const token = auth.replace('Bearer ', '').trim();
+  const token = auth.replace(/^Bearer\s+/, '').trim();
   if (ADMIN_TOKENS.has(token)) return next();
   res.status(401).json({ detail: 'Unauthorized' });
 }
 
 // ── Admin API routes ─────────────────────────────────────────
-app.post('/admin/api/login', (req, res) => {
+app.post('/admin/api/login', authLimiter, (req, res) => {
   const { username, password } = req.body || {};
-  if (username !== ADMIN_USERNAME || password !== ADMIN_PASSWORD) {
+  // [PR-0.4] 密码比对用恒定时间
+  const u = String(username || '');
+  const p = String(password || '');
+  const uMatch = u.length === ADMIN_USERNAME.length &&
+    crypto.timingSafeEqual(Buffer.from(u), Buffer.from(ADMIN_USERNAME));
+  const pMatch = p.length === ADMIN_PASSWORD.length &&
+    crypto.timingSafeEqual(Buffer.from(p), Buffer.from(ADMIN_PASSWORD));
+  if (!uMatch || !pMatch) {
     return res.status(403).json({ detail: 'Invalid credentials' });
   }
-  const token = crypto.randomBytes(32).toString('hex');
-  ADMIN_TOKENS.add(token);
+  const token = ADMIN_TOKENS.issue();
   res.json({ token });
 });
 
-app.get('/admin/api/stats', adminAuth, (req, res) => {
+app.get('/admin/api/stats', adminLimiter, adminAuth, (req, res) => {
   const uptime = Math.floor((Date.now() - stats.start_time) / 1000);
   const avg = stats.total_requests > 0 ? Math.round(stats.total_latency_ms / stats.total_requests) : 0;
   res.json({
@@ -126,10 +281,11 @@ app.get('/admin/api/stats', adminAuth, (req, res) => {
     failed_requests: stats.failed_requests,
     avg_latency_ms: avg,
     uptime_secs: uptime,
+    admin_tokens_active: ADMIN_TOKENS.size(),
   });
 });
 
-app.get('/admin/api/accounts', adminAuth, (req, res) => {
+app.get('/admin/api/accounts', adminLimiter, adminAuth, (req, res) => {
   const all = db.getAllAccounts();
   res.json({
     accounts: all.map(a => ({
@@ -146,7 +302,7 @@ app.get('/admin/api/accounts', adminAuth, (req, res) => {
   });
 });
 
-app.post('/admin/api/accounts', adminAuth, (req, res) => {
+app.post('/admin/api/accounts', adminLimiter, adminAuth, (req, res) => {
   const { token, cookies, email } = req.body || {};
   if (!token || !cookies) {
     return res.status(400).json({ detail: 'Token and cookies required' });
@@ -161,7 +317,7 @@ function getAccountByIndex(idx) {
   return null;
 }
 
-app.delete('/admin/api/accounts/:index', adminAuth, (req, res) => {
+app.delete('/admin/api/accounts/:index', adminLimiter, adminAuth, (req, res) => {
   const acct = getAccountByIndex(parseInt(req.params.index));
   if (acct) {
     db.deleteAccount(acct.id);
@@ -171,7 +327,7 @@ app.delete('/admin/api/accounts/:index', adminAuth, (req, res) => {
   }
 });
 
-app.post('/admin/api/accounts/:index/relogin', adminAuth, async (req, res) => {
+app.post('/admin/api/accounts/:index/relogin', adminLimiter, adminAuth, async (req, res) => {
   const acct = getAccountByIndex(parseInt(req.params.index));
   if (!acct) {
     return res.status(404).json({ ok: false, message: 'Account not found' });
@@ -558,19 +714,19 @@ async function handleDeepSeekCompletion(req, res, mode) {
 }
 
 // Chat endpoints
-app.post('/api/v0/chat/completion', async (req, res) => {
+app.post('/api/v0/chat/completion', chatLimiter, async (req, res) => {
   await handleDeepSeekCompletion(req, res, 'completion');
 });
 
-app.post('/api/v0/chat/regenerate', async (req, res) => {
+app.post('/api/v0/chat/regenerate', chatLimiter, async (req, res) => {
   await handleDeepSeekCompletion(req, res, 'regenerate');
 });
 
-app.post('/api/v0/chat/continue', async (req, res) => {
+app.post('/api/v0/chat/continue', chatLimiter, async (req, res) => {
   await handleDeepSeekCompletion(req, res, 'completion');
 });
 
-app.post('/api/v0/chat/edit_message', async (req, res) => {
+app.post('/api/v0/chat/edit_message', chatLimiter, async (req, res) => {
   await handleDeepSeekCompletion(req, res, 'edit_message');
 });
 
@@ -622,7 +778,16 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`DeepSeek Mirror running at http://localhost:${PORT}`);
     console.log(`Admin panel: http://localhost:${PORT}/admin/`);
-    console.log('Direct DeepSeek API integration enabled (no web2api needed)');
+    console.log(`NODE_ENV=${process.env.NODE_ENV}`);
+    if (ADMIN_BOOT.generated) {
+      console.log('');
+      console.log('============================================================');
+      console.log(' [PR-0.4] 临时管理员凭据已生成（请保存，下次启动不再显示）');
+      console.log(`   用户名: ${ADMIN_USERNAME}`);
+      console.log(`   密  码: ${ADMIN_PASSWORD}`);
+      console.log(' 建议在 .env 中设置 ADMIN_USERNAME / ADMIN_PASSWORD 永久化。');
+      console.log('============================================================');
+    }
   });
 }
 start();

@@ -6,8 +6,10 @@
 
 **自建 DeepSeek Chat 镜像站 · 实验性项目**
 
-[![Node](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/Node.js-20%2B-339933?logo=node.js)](https://nodejs.org)
+[![Tests](https://img.shields.io/badge/tests-21%2F21_passing-brightgreen?logo=github)](https://github.com/snake-aabb-wtf/deepseek-mirror/actions)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](./CHANGELOG.md)
 [![Warning](https://img.shields.io/badge/status-experimental-orange)](#)
 
 > ⚠️ **警告：本项目为实验性逆向工程，开发尚不完备，存在较多已知 bug。**  
@@ -110,7 +112,7 @@ DeepSeek Mirror 解决了这两个问题：自动求解 PoW、代理私有协议
 
 ### 前置条件
 
-- Node.js 24+
+- Node.js 20+（推荐 24）
 - npm
 - 一个可用的 DeepSeek 网页版账号
 
@@ -123,24 +125,44 @@ cd deepseek-mirror
 # 2. 安装依赖
 npm install
 
-> 无需手动创建数据库。首次启动时 SQLite 数据库文件 `sessions.db` 会自动生成。
-
-# 3. 配置环境变量
+# 3. 配置环境变量（必填 SESSION_SECRET + DB_ENCRYPT_KEY）
 cp .env.example .env
-# 编辑 .env，如修改管理员密码等（可选）
+# 自动生成密钥：
+#   node -e "console.log('SESSION_SECRET=' + require('crypto').randomBytes(48).toString('hex'))" >> .env
+#   node -e "console.log('DB_ENCRYPT_KEY=' + require('crypto').randomBytes(32).toString('hex'))" >> .env
 
-# 4. 启动服务
-node server.js
-# 或 Windows 双击 start.bat
+# 4. 启动（任选其一）
+node server.js           # 裸跑
+./start.sh               # Linux/macOS 一键（自动生成密钥 + npm ci）
+pm2 start ecosystem.config.cjs   # PM2 进程管理
+docker compose up -d     # Docker 一键
 ```
 
-启动后访问 `http://localhost:3000`
+> 启动时若 `ADMIN_PASSWORD` 留空，服务会在控制台**打印一次**临时管理员密码。  
+> 首次启动 SQLite 数据库 `sessions.db` 会自动生成（better-sqlite3 格式），旧 sql.js 数据库会自动迁移。
+
+### 部署方式
+
+| 方式 | 命令 | 适用场景 |
+|------|------|----------|
+| 裸跑 | `node server.js` | 开发 / 临时 |
+| 一键脚本 | `./start.sh` | Linux/macOS 快速部署 |
+| PM2 | `pm2 start ecosystem.config.cjs` | 长期运行（自动重启） |
+| Docker | `docker compose up -d` | 容器化（自动重启 + 数据卷） |
+
+**Docker 数据卷**：`mirror-data` 命名卷持久化 `sessions.db` 和 `.env`。
+
+### 监控
+
+- **健康检查**：`GET /auth.css`（Docker HEALTCHECK）
+- **Prometheus 指标**：`GET /metrics`（11 个指标）
+- **管理面板**：`/admin/`（账号池 + 统计 + 实时刷新）
 
 ### 第一步：添加上游账号
 
 镜像站刚启动时账号池为空，需要先添加一个 DeepSeek 账号才能使用聊天功能：
 
-1. 打开 `http://localhost:3000/admin/` → 使用管理员账号登录（默认 `admin / admin`）
+1. 打开 `http://localhost:3000/admin/` → 使用管理员账号登录（首次启动时控制台打印的临时密码，或 `.env` 中配置的 `ADMIN_PASSWORD`）
 2. 进入「账号池」页面
 3. 点击「添加」，填写以下两项：
 
@@ -428,32 +450,42 @@ ADMIN_PASSWORD=admin
 
 ## 开发计划 / TODO
 
-### 已知 Bug
+> 详细变更记录见 [CHANGELOG.md](./CHANGELOG.md)。
 
-- [ ] **session 不持久化** — `express-session` 使用内存 store，重启后所有用户需重新登录
-- [ ] **账号池凭据无自动续期** — DeepSeek 的 Token/Cookie 过期后，管理员需手动更新
-- [ ] **PoW 求解偶尔失败** — 极少数情况下 WASM 返回 0（无解），目前不自动重试
-- [ ] **无 HTTPS** — 默认 HTTP，生产部署需在前面加反向代理
-- [ ] **fetch timeout 未设置** — 专家模式思考时间可能超过 60s，可能触发底层 timeout
-- [ ] **并发限制** — N 个账号最多 N 个并发聊天，超出时返回"没有可用账号"
+### v1.1.0 已修复
 
-### 待实现功能
+- [x] **session 安全性** — `httpOnly + secure + sameSite` cookie + regenerate 防 fixation (PR-0)
+- [x] **凭据明文存储** — AES-256-GCM 加密 (PR-1)
+- [x] **IDOR (跨用户访问)** — 所有 db 操作用 userId 隔离 (PR-3)
+- [x] **admin token XSS 风险** — httpOnly cookie 替代 localStorage (PR-4)
+- [x] **WASM memory grow buffer 失效** — 预 grow 16 页 (PR-2)
+- [x] **弱密码** — 10 位 + 复杂度 (PR-0)
+- [x] **时序攻击 / 用户名枚举** — timingSafeEqual + 统一错误 (PR-0)
+- [x] **fetch timeout** — 30s 总 + 10min SSE idle (PR-2)
+- [x] **并发账号重复** — SQL RETURNING 原子 (PR-3)
+- [x] **PoW 失败无重试** — 2 次重试 + resp.ok 检查 (PR-2)
+- [x] **Docker 部署** — Dockerfile + docker-compose (PR-5)
+- [x] **使用量统计** — outcome 细分 + Prometheus 指标 (PR-3/5)
+- [x] **结构化日志** — pino + 组件化 (PR-4)
+- [x] **依赖 CVE** — http-proxy-middleware 升 2.0.10 (PR-5)
 
-- [ ] **Session 持久化** — 添加 `connect-sqlite3` 或 Redis store
+### 仍待办
+
+- [ ] **Session 持久化** — 内存 store 重启失效（生产建议 Redis）
+- [ ] **账号池凭据无自动续期** — 凭据过期需手动更新
 - [ ] **暗/亮主题切换** — 目前仅适配暗色
-- [ ] **自定义欢迎页** — 替换 SPA 默认的 DeepSeek 欢迎页
-- [ ] **管理员账号 SQLite 化** — 管理员密码也存储在数据库中，支持面板修改
-- [ ] **自动凭据续期** — 定时检测账号健康，过期时自动通知
-- [ ] **使用量统计** — 按用户统计聊天次数、token 消耗
-- [ ] **Docker 部署** — 提供 Dockerfile 和 docker-compose
-- [ ] **更好的错误处理** — 各种边界情况的友好提示
+- [ ] **自定义欢迎页** — 替换 SPA 默认 DeepSeek 欢迎页
+- [ ] **管理员账号 SQLite 化** — 面板内修改管理员密码
+- [ ] **HTTPS** — 默认 HTTP，需前置 nginx/Caddy
+- [ ] **多模态支持** — DeepSeek 协议未公开图片上传
+- [ ] **工具调用** — DSML/function calling（需修改 SPA）
+- [ ] **OpenAI 兼容接口** — `/v1/chat/completions` 标准
 
 ### 已知限制
 
 - **不可与官方 DeepSeek 同时使用** — Token 和 Cookie 从同一浏览器提取，回话可能会冲突
-- **无多模态支持** — 不支持图片上传，DeepSeek 网页版本身也不支持
-- **无工具调用** — 不实现 DSML/function calling（实现需要修改 SPA）
 - **上游协议变更风险** — DeepSeek 随时可能更新前端或 API 协议，导致镜像站失效
+- **PoW 偶尔失败** — 已加重试但仍可能 0 成功率（上游 challenge 无解）
 
 ---
 

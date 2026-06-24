@@ -4,10 +4,12 @@
 
 # DeepSeek Mirror
 
-**Self-Hosted DeepSeek Chat Mirror · Experimental**
+**Self-hosted DeepSeek Chat mirror · Experimental**
 
-[![Node](https://img.shields.io/badge/Node.js-24%2B-339933?logo=node.js)](https://nodejs.org)
+[![Node](https://img.shields.io/badge/Node.js-20%2B-339933?logo=node.js)](https://nodejs.org)
+[![Tests](https://img.shields.io/badge/tests-21%2F21_passing-brightgreen?logo=github)](https://github.com/snake-aabb-wtf/deepseek-mirror/actions)
 [![License](https://img.shields.io/badge/license-MIT-blue)](#license)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue)](./CHANGELOG.md)
 [![Warning](https://img.shields.io/badge/status-experimental-orange)](#)
 
 > ⚠️ **Warning: This is an experimental reverse-engineering project. It is incomplete and has known bugs.**
@@ -110,7 +112,7 @@ DeepSeek Mirror solves both problems: automated PoW solving and private protocol
 
 ### Prerequisites
 
-- Node.js 24+
+- Node.js 20+ (24 recommended)
 - npm
 - A DeepSeek web app account
 
@@ -121,23 +123,43 @@ cd deepseek-mirror
 npm install
 ```
 
-> No need to create a database manually. The SQLite file `sessions.db` is auto-created on first start.
-
-### Configure
+### Configure (mandatory: SESSION_SECRET + DB_ENCRYPT_KEY)
 
 ```bash
 cp .env.example .env
-# Edit .env (optional, e.g., change admin password)
+# Auto-generate keys:
+node -e "console.log('SESSION_SECRET=' + require('crypto').randomBytes(48).toString('hex'))" >> .env
+node -e "console.log('DB_ENCRYPT_KEY=' + require('crypto').randomBytes(32).toString('hex'))" >> .env
 ```
 
-### Start
+### Start (pick one)
 
 ```bash
-node server.js
-# Or double-click start.bat (Windows)
+node server.js                      # Plain
+./start.sh                          # Linux/macOS one-liner (auto-generates keys + npm ci)
+pm2 start ecosystem.config.cjs      # PM2 process manager
+docker compose up -d                # Docker
 ```
 
-Visit `http://localhost:3000`
+> If `ADMIN_PASSWORD` is empty, the server prints a **one-time** temporary admin password to the console on first start.  
+> The SQLite `sessions.db` is auto-created on first start (better-sqlite3 format). Legacy sql.js DBs are auto-migrated.
+
+### Deployment Options
+
+| Method | Command | Use Case |
+|--------|---------|----------|
+| Plain | `node server.js` | Dev / quick test |
+| One-liner | `./start.sh` | Linux/macOS quick deploy |
+| PM2 | `pm2 start ecosystem.config.cjs` | Long-running (auto-restart) |
+| Docker | `docker compose up -d` | Containerized (auto-restart + volume) |
+
+**Docker volume**: `mirror-data` named volume persists `sessions.db` and `.env`.
+
+### Monitoring
+
+- **Health check**: `GET /auth.css` (Docker HEALTHCHECK)
+- **Prometheus metrics**: `GET /metrics` (11 metrics)
+- **Admin panel**: `/admin/` (account pool + stats + live refresh)
 
 ### Step 1: Add an Upstream Account
 
@@ -408,32 +430,42 @@ All settings are optional — defaults are used if not set.
 
 ## Roadmap / TODO
 
-### Known Bugs
+> Detailed change log: [CHANGELOG.md](./CHANGELOG.md)
 
-- [ ] **Sessions not persisted** — `express-session` uses in-memory store; all users must re-login after restart
-- [ ] **No auto-refresh for account credentials** — DeepSeek tokens/cookies expire, admin must update manually
-- [ ] **WASM PoW sometimes fails** — solver returns 0 (no solution) occasionally; no auto-retry
-- [ ] **No HTTPS** — HTTP only; needs reverse proxy for production
-- [ ] **No fetch timeout** — expert mode may exceed OS-level timeout during long thinking (>60s)
-- [ ] **Concurrency limit** — N accounts = N concurrent chats max; beyond that returns "no available account"
+### Fixed in v1.1.0
 
-### Planned Features
+- [x] **Session security** — `httpOnly + secure + sameSite` cookies + regenerate (PR-0)
+- [x] **Plaintext credentials in DB** — AES-256-GCM encryption (PR-1)
+- [x] **IDOR (cross-user access)** — all db ops use userId (PR-3)
+- [x] **admin token XSS risk** — httpOnly cookie replaces localStorage (PR-4)
+- [x] **WASM memory grow buffer detached** — pre-grow 16 pages (PR-2)
+- [x] **Weak passwords** — 10 chars + complexity (PR-0)
+- [x] **Timing attack / username enumeration** — timingSafeEqual + unified errors (PR-0)
+- [x] **fetch timeout** — 30s total + 10min SSE idle (PR-2)
+- [x] **Concurrent account collision** — SQL RETURNING atomic (PR-3)
+- [x] **PoW failure no retry** — 2 retries + resp.ok check (PR-2)
+- [x] **Docker deployment** — Dockerfile + docker-compose (PR-5)
+- [x] **Usage stats** — outcome breakdown + Prometheus metrics (PR-3/5)
+- [x] **Structured logging** — pino + components (PR-4)
+- [x] **Dependency CVE** — http-proxy-middleware 2.0.10 (PR-5)
 
-- [ ] **Persistent sessions** — add `connect-sqlite3` or Redis store
+### Still TODO
+
+- [ ] **Persistent sessions** — in-memory store loses data on restart (Redis recommended)
+- [ ] **No auto-refresh for account credentials** — manual update required on expiry
 - [ ] **Light/dark theme toggle** — currently dark-only
-- [ ] **Custom welcome page** — replace DeepSeek's default landing page
-- [ ] **SQLite-based admin accounts** — admin passwords stored in DB, configurable from panel
-- [ ] **Auto credential refresh** — periodic health checks + notifications on expiry
-- [ ] **Usage statistics per user** — track chat count, approximate token consumption
-- [ ] **Docker deployment** — Dockerfile + docker-compose
-- [ ] **Better error handling** — friendly messages for all edge cases
+- [ ] **Custom welcome page** — replace DeepSeek's default landing
+- [ ] **SQLite-based admin accounts** — admin password editable from panel
+- [ ] **HTTPS** — HTTP only; needs nginx/Caddy in front
+- [ ] **Multimodal** — DeepSeek protocol doesn't expose image upload
+- [ ] **Function calling** — DSML/tools (requires SPA modification)
+- [ ] **OpenAI-compatible API** — `/v1/chat/completions` standard endpoint
 
 ### Known Limitations
 
 - **Cannot use simultaneously with the official DeepSeek web app** — tokens/cookies were extracted from the same browser, sessions may conflict
-- **No multimodal support** — image upload not supported (DeepSeek's web app doesn't support it either)
-- **No function calling** — DSML/function calling not implemented (would require SPA modification)
 - **Upstream protocol may change** — DeepSeek may update their frontend or API at any time, breaking the mirror
+- **WASM PoW may occasionally fail** — even with retries, upstream challenges can be unsolvable
 
 ---
 

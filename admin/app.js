@@ -1,10 +1,27 @@
+// admin/app.js — PR-3 改进
+// 修复：
+//   - [PR-3.6] setInterval 泄漏：返回 cleanup 函数，render() 调用上一个 cleanup
+//   - [PR-3.6] 5s 轮询竞态：generation + inFlight 标志
+//   - [PR-3.3] 账号 API 从 :index 改为 :id
+//   - 删除 loginRendered 标志（每次 token 变化全量重渲染）
+//   - a.state 加白名单防属性注入
+//   - 错误消息用 textContent 替代 innerHTML
+
 const STATE = {
   token: localStorage.getItem("admin_token") || null,
   view: "dashboard",
+  cleanup: null,  // 当前页面的 cleanup 函数
 };
 
-function setToken(t) { STATE.token = t; if (t) localStorage.setItem("admin_token", t); else localStorage.removeItem("admin_token"); }
-function authHeader() { return STATE.token ? { "Authorization": `Bearer ${STATE.token}` } : {}; }
+function setToken(t) {
+  STATE.token = t;
+  if (t) localStorage.setItem("admin_token", t);
+  else localStorage.removeItem("admin_token");
+}
+
+function authHeader() {
+  return STATE.token ? { "Authorization": `Bearer ${STATE.token}` } : {};
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -22,7 +39,7 @@ async function api(path, opts = {}) {
 function toast(msg, type = "ok") {
   const el = document.createElement("div");
   el.className = `toast ${type}`;
-  el.textContent = msg;
+  el.textContent = msg;  // textContent 防 XSS
   document.body.appendChild(el);
   setTimeout(() => el.remove(), 3000);
 }
@@ -35,39 +52,44 @@ function navigate(view) {
 
 window.addEventListener("hashchange", () => {
   const view = window.location.hash.slice(1) || "dashboard";
-  STATE.view = view;
-  render();
+  if (view !== STATE.view) {
+    STATE.view = view;
+    render();
+  }
 });
 
 const ICON = {
   dashboard: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>',
   users: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>',
-  login: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>',
+  login: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y1="12"/></svg>',
   activity: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>',
-  settings: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>',
   refresh: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>',
-  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>',
-  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
-  logOut: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>',
+  plus: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><line x1="12" y1="5" x2="12" y1="19"/><line x1="5" y1="12" x2="19" y1="12"/></svg>',
+  x: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><line x1="18" y1="6" x2="6" y1="18"/><line x1="6" y1="6" x2="18" y1="18"/></svg>',
+  logOut: '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y1="12"/></svg>',
   reload: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:14px;height:14px"><path d="M1 4v6h6"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>',
 };
 
-let loginRendered = false;
-
 function render() {
+  // [PR-3.6] 先清理上一页面
+  if (STATE.cleanup) {
+    try { STATE.cleanup(); } catch { /* ignore */ }
+    STATE.cleanup = null;
+  }
+
   const app = document.getElementById("app");
   if (!STATE.token) {
-    if (!loginRendered) { app.innerHTML = renderLogin(); attachLogin(); loginRendered = true; }
+    app.innerHTML = renderLogin();
+    attachLogin();
     return;
   }
-  loginRendered = false;
   app.innerHTML = renderLayout();
 
   const main = document.getElementById("page-content");
   switch (STATE.view) {
-    case "dashboard": renderDashboard(main); break;
-    case "accounts": renderAccounts(main); break;
-    default: renderDashboard(main);
+    case "dashboard": STATE.cleanup = renderDashboard(main); break;
+    case "accounts":  STATE.cleanup = renderAccounts(main); break;
+    default: STATE.cleanup = renderDashboard(main);
   }
 
   document.querySelectorAll(".nav-item").forEach(el => {
@@ -113,16 +135,27 @@ function renderLogin() {
   </div>`;
 }
 
+function setLoginError(msg) {
+  const div = document.getElementById("login-error");
+  if (!div) return;
+  div.textContent = "";  // 清空
+  if (msg) {
+    const err = document.createElement("div");
+    err.className = "login-error";
+    err.textContent = msg;
+    div.appendChild(err);
+  }
+}
+
 function attachLogin() {
   const btn = document.getElementById("login-btn");
   const inputUsr = document.getElementById("usr");
   const inputPwd = document.getElementById("pwd");
-  const errDiv = document.getElementById("login-error");
 
   async function doLogin() {
     const usr = inputUsr.value.trim();
     const pwd = inputPwd.value.trim();
-    if (!usr || !pwd) { errDiv.innerHTML = '<div class="login-error">请输入账号和密码</div>'; return; }
+    if (!usr || !pwd) { setLoginError("请输入账号和密码"); return; }
     btn.disabled = true;
     btn.textContent = "登录中…";
     try {
@@ -132,7 +165,7 @@ function attachLogin() {
       setToken(res.token);
       render();
     } catch (e) {
-      errDiv.innerHTML = `<div class="login-error">${e.message}</div>`;
+      setLoginError(e.message);
       btn.disabled = false;
       btn.innerHTML = `${ICON.login} 登录`;
     }
@@ -142,7 +175,7 @@ function attachLogin() {
   inputPwd.onkeydown = (e) => { if (e.key === "Enter") doLogin(); };
 }
 
-async function renderDashboard(el) {
+function renderDashboard(el) {
   el.innerHTML = `<h1 class="page-title">${ICON.activity} 概览</h1>
     <div class="stats-grid" id="stats-grid">
       <div class="stat-card"><div class="label">总请求</div><div class="value accent" id="stat-total">-</div></div>
@@ -165,44 +198,66 @@ async function renderDashboard(el) {
       </div>
     </div>`;
 
+  // [PR-3.6] generation 防止旧请求覆盖新数据
+  let gen = 0;
+  let inFlight = false;
+  let stopped = false;
+
   async function refresh() {
+    if (inFlight || stopped) return;
+    inFlight = true;
+    const myGen = ++gen;
     try {
       const [stats, accts] = await Promise.all([
         api("/admin/api/stats"),
         api("/admin/api/accounts"),
       ]);
-      document.getElementById("stat-total").textContent = stats.total_requests ?? 0;
-      document.getElementById("stat-success").textContent = stats.success_requests ?? 0;
-      document.getElementById("stat-fail").textContent = stats.failed_requests ?? 0;
+      // [PR-3.6] 防止过期请求覆盖
+      if (myGen !== gen || stopped) return;
+      const $ = (id) => document.getElementById(id);
+      if ($("stat-total")) $("stat-total").textContent = stats.total_requests ?? 0;
+      if ($("stat-success")) $("stat-success").textContent = stats.success_requests ?? 0;
+      if ($("stat-fail")) $("stat-fail").textContent = stats.failed_requests ?? 0;
       const rate = stats.total_requests > 0
         ? ((stats.success_requests / stats.total_requests) * 100).toFixed(1) + "%"
         : "-";
-      document.getElementById("stat-rate").textContent = rate;
-      document.getElementById("stat-lat").textContent = stats.avg_latency_ms > 0 ? stats.avg_latency_ms + "ms" : "-";
-      document.getElementById("stat-uptime").textContent = fmtUptime(stats.uptime_secs);
+      if ($("stat-rate")) $("stat-rate").textContent = rate;
+      if ($("stat-lat")) $("stat-lat").textContent = stats.avg_latency_ms > 0 ? stats.avg_latency_ms + "ms" : "-";
+      if ($("stat-uptime")) $("stat-uptime").textContent = fmtUptime(stats.uptime_secs);
 
-      document.getElementById("pool-total").textContent = accts.total ?? 0;
-      document.getElementById("pool-idle").textContent = accts.idle ?? 0;
-      document.getElementById("pool-busy").textContent = accts.busy ?? 0;
-      document.getElementById("pool-error").textContent = accts.error ?? 0;
+      if ($("pool-total")) $("pool-total").textContent = accts.total ?? 0;
+      if ($("pool-idle")) $("pool-idle").textContent = accts.idle ?? 0;
+      if ($("pool-busy")) $("pool-busy").textContent = accts.busy ?? 0;
+      if ($("pool-error")) $("pool-error").textContent = accts.error ?? 0;
 
-      const badgesEl = document.getElementById("pool-badges");
-      if (accts.accounts && accts.accounts.length) {
-        badgesEl.innerHTML = accts.accounts.map(a =>
-          `<span class="badge ${a.state}">${esc(a.email)}</span>`
-        ).join("");
-      } else {
-        badgesEl.innerHTML = '<div class="empty">暂无账号</div>';
+      const badgesEl = $("pool-badges");
+      if (badgesEl) {
+        if (accts.accounts && accts.accounts.length) {
+          badgesEl.innerHTML = accts.accounts.map(a =>
+            `<span class="badge ${stateWhitelist(a.state)}">${esc(a.email)}</span>`
+          ).join("");
+        } else {
+          badgesEl.innerHTML = '<div class="empty">暂无账号</div>';
+        }
       }
-    } catch (e) { /* polling retries */ }
+    } catch (e) {
+      if (!stopped) console.warn('refresh err:', e);
+    } finally {
+      inFlight = false;
+    }
   }
 
   refresh();
   const iv = setInterval(refresh, 5000);
-  el._iv = iv;
+  // [PR-3.6] 返回 cleanup
+  return () => {
+    stopped = true;
+    clearInterval(iv);
+    gen++;  // 取消所有在途请求
+  };
 }
 
-async function renderAccounts(el) {
+function renderAccounts(el) {
   el.innerHTML = `<h1 class="page-title">${ICON.users} 账号池</h1>
     <div class="section">
       <div class="section-header">添加账号</div>
@@ -242,6 +297,7 @@ async function renderAccounts(el) {
         wrap.innerHTML = '<div class="empty">暂无账号</div>';
         return;
       }
+      // [PR-3.3] 用 a.id 而非 index
       wrap.innerHTML = `<table>
         <thead><tr>
           <th>标识</th>
@@ -250,16 +306,16 @@ async function renderAccounts(el) {
           <th>最后错误</th>
           <th style="width:100px">操作</th>
         </tr></thead>
-        <tbody>${accounts.map((a, i) => `<tr>
+        <tbody>${accounts.map(a => `<tr>
           <td><span class="truncate" style="max-width:200px;display:inline-block">${esc(a.email)}</span></td>
-          <td><span class="badge ${a.state}">${stateLabel(a.state)}</span></td>
+          <td><span class="badge ${stateWhitelist(a.state)}">${stateLabel(a.state)}</span></td>
           <td>${a.error_count}</td>
           <td class="text-muted truncate" style="max-width:240px">${esc(a.last_error) || '-'}</td>
           <td>
             ${a.state === 'error'
-              ? `<button class="btn btn-sm btn-outline" onclick="reloginAccount(${i})">${ICON.reload} 重登</button>`
+              ? `<button class="btn btn-sm btn-outline" onclick="reloginAccount(${a.id})">${ICON.reload} 重登</button>`
               : '<span class="text-muted text-sm">-</span>'}
-            <button class="btn-icon danger" onclick="removeAccount(${i})" title="删除">${ICON.x}</button>
+            <button class="btn-icon danger" onclick="removeAccount(${a.id})" title="删除">${ICON.x}</button>
           </td>
         </tr>`).join("")}</tbody>
       </table>`;
@@ -287,20 +343,24 @@ async function renderAccounts(el) {
 
   document.getElementById("acct-refresh-btn").onclick = loadList;
   loadList();
+
+  // 简单 cleanup: 无 interval
+  return () => {};
 }
 
-async function reloginAccount(index) {
+// [PR-3.3] API 用 id 而非 index
+async function reloginAccount(id) {
   try {
-    const res = await api(`/admin/api/accounts/${index}/relogin`, { method: "POST" });
+    const res = await api(`/admin/api/accounts/${id}/relogin`, { method: "POST" });
     if (res.ok) { toast("重登录成功"); render(); }
     else { toast(`重登录失败: ${res.message}`, "err"); render(); }
   } catch (e) { toast(e.message, "err"); }
 }
 
-async function removeAccount(index) {
+async function removeAccount(id) {
   if (!confirm("确定删除此账号？")) return;
   try {
-    await api(`/admin/api/accounts/${index}`, { method: "DELETE" });
+    await api(`/admin/api/accounts/${id}`, { method: "DELETE" });
     toast("账号已删除");
     render();
   } catch (e) { toast(e.message, "err"); }
@@ -320,6 +380,12 @@ function fmtUptime(s) {
 
 function stateLabel(s) {
   return { idle: "空闲", busy: "繁忙", error: "异常" }[s] || s;
+}
+
+// [PR-3] state 白名单：防止 state 注入到 class 属性
+const VALID_STATES = { idle: 1, busy: 1, error: 1 };
+function stateWhitelist(s) {
+  return VALID_STATES[s] ? s : 'idle';
 }
 
 function esc(s) {

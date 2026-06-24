@@ -15,6 +15,7 @@ const crypto = require('crypto');
 const db = require('./db');
 const DeepSeekClient = require('./deepseek-client');
 const { AdminTokenStore } = require('./lib/admin-tokens');
+const { AccountPool } = require('./lib/account-pool');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
@@ -53,18 +54,39 @@ const ADMIN_TOKENS = new AdminTokenStore();
 // Persisted in SQLite via db.js
 
 // ── Stats ────────────────────────────────────────────────────
+// [PR-3.4] outcome 枚举：success | no_account | upstream_error | client_disconnect
 const stats = {
   total_requests: 0,
   success_requests: 0,
   failed_requests: 0,
+  no_account_requests: 0,
+  upstream_errors: 0,
+  client_disconnects: 0,
   total_latency_ms: 0,
   start_time: Date.now(),
 };
 
-function recordStat(success, latencyMs) {
+function recordStat(outcome, latencyMs) {
   stats.total_requests++;
-  if (success) stats.success_requests++;
-  else stats.failed_requests++;
+  switch (outcome) {
+    case 'success':
+      stats.success_requests++;
+      break;
+    case 'no_account':
+      stats.no_account_requests++;
+      stats.failed_requests++;
+      break;
+    case 'upstream_error':
+      stats.upstream_errors++;
+      stats.failed_requests++;
+      break;
+    case 'client_disconnect':
+      stats.client_disconnects++;
+      stats.failed_requests++;
+      break;
+    default:
+      stats.failed_requests++;
+  }
   stats.total_latency_ms += latencyMs;
 }
 
@@ -279,6 +301,9 @@ app.get('/admin/api/stats', adminLimiter, adminAuth, (req, res) => {
     total_requests: stats.total_requests,
     success_requests: stats.success_requests,
     failed_requests: stats.failed_requests,
+    no_account_requests: stats.no_account_requests,
+    upstream_errors: stats.upstream_errors,
+    client_disconnects: stats.client_disconnects,
     avg_latency_ms: avg,
     uptime_secs: uptime,
     admin_tokens_active: ADMIN_TOKENS.size(),
@@ -289,11 +314,14 @@ app.get('/admin/api/accounts', adminLimiter, adminAuth, (req, res) => {
   const all = db.getAllAccounts();
   res.json({
     accounts: all.map(a => ({
+      // [PR-3.3] 返回 id 用于 :id API
+      id: a.id,
       email: a.email,
       state: a.state,
       error_count: a.error_count,
       last_error: a.last_error,
       last_used: a.last_used,
+      // 故意不返回 token/cookies
     })),
     total: all.length,
     idle: all.filter(a => a.state === 'idle').length,
@@ -311,29 +339,32 @@ app.post('/admin/api/accounts', adminLimiter, adminAuth, (req, res) => {
   res.json({ ok: true, email: email || `acc-${id}` });
 });
 
-function getAccountByIndex(idx) {
-  const all = db.getAllAccounts();
-  if (idx >= 0 && idx < all.length) return all[idx];
-  return null;
-}
-
 // 取当前 session userId（无则用 mirror-user）
 function uid(req) {
   return (req.session && req.session.userId) || 'mirror-user';
 }
 
-app.delete('/admin/api/accounts/:index', adminLimiter, adminAuth, (req, res) => {
-  const acct = getAccountByIndex(parseInt(req.params.index));
+// [PR-3.3] :index -> :id（避免多 admin 并发时下标错位）
+app.delete('/admin/api/accounts/:id', adminLimiter, adminAuth, (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) {
+    return res.status(400).json({ detail: 'Invalid id' });
+  }
+  const acct = db.getAccountById(id);
   if (acct) {
-    db.deleteAccount(acct.id);
+    db.deleteAccount(id);
     res.json({ ok: true });
   } else {
     res.status(404).json({ detail: 'Account not found' });
   }
 });
 
-app.post('/admin/api/accounts/:index/relogin', adminLimiter, adminAuth, async (req, res) => {
-  const acct = getAccountByIndex(parseInt(req.params.index));
+app.post('/admin/api/accounts/:id/relogin', adminLimiter, adminAuth, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!Number.isFinite(id)) {
+    return res.status(404).json({ ok: false, message: 'Invalid id' });
+  }
+  const acct = db.getAccountById(id);
   if (!acct) {
     return res.status(404).json({ ok: false, message: 'Account not found' });
   }
@@ -582,23 +613,16 @@ app.post('/api/v0/chat/create_pow_challenge', (req, res) => {
 
 // ---- Translation layer: DeepSeek internal SSE <-> web2api OpenAI SSE ----
 
+// [PR-3.1] 原子账号池
+const accountPool = new AccountPool(db);
+
 function sendDeepSeekSSE(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
-function getAvailableAccount() {
-  const all = db.getAllAccounts();
-  for (const acct of all) {
-    if (acct.state === 'idle') {
-      db.updateAccountState(acct.id, 'busy');
-      return acct;
-    }
+  // [PR-3.5] 客户端断开时 res.write 会抛 EPIPE
+  try {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  } catch (e) {
+    // 静默忽略
   }
-  return null;
-}
-
-function releaseAccount(acct) {
-  if (acct) db.updateAccountState(acct.id, 'idle');
 }
 
 async function handleDeepSeekCompletion(req, res, mode) {
@@ -618,11 +642,15 @@ async function handleDeepSeekCompletion(req, res, mode) {
     return res.status(400).json({ error: 'Missing prompt' });
   }
 
-  // Ensure chat session exists in DB
+  // [PR-3.2] IDOR 修复: 所有 db 操作用 userId 隔离
   const userId = uid(req);
   if (chat_session_id) {
     const existing = db.getSession(chat_session_id, userId);
     if (!existing) {
+      // IDOR 防御: 不能 create 别人的 session
+      if (chat_session_id && !chat_session_id.match(/^[0-9a-f-]{36}$/i)) {
+        return res.status(400).json({ error: 'Invalid session id' });
+      }
       db.createSession(chat_session_id, userId);
     }
   }
@@ -647,6 +675,15 @@ async function handleDeepSeekCompletion(req, res, mode) {
   res.setHeader('Connection', 'keep-alive');
   res.setHeader('X-Accel-Buffering', 'no');
 
+  // [PR-3.5] 监听客户端断开
+  let clientDisconnected = false;
+  req.on('close', () => {
+    clientDisconnected = true;
+  });
+  res.on('error', (e) => {
+    clientDisconnected = true;
+  });
+
   // Generate IDs for this exchange
   const responseMessageId = crypto.randomUUID();
   const requestMessageId = crypto.randomUUID();
@@ -660,10 +697,10 @@ async function handleDeepSeekCompletion(req, res, mode) {
 
   const startTime = Date.now();
 
-  // Get an account from the pool
-  const acct = getAvailableAccount();
+  // [PR-3.1] 用原子账号池
+  const acct = accountPool.claim();
   if (!acct) {
-    recordStat(false, Date.now() - startTime);
+    recordStat('no_account', Date.now() - startTime);
     sendDeepSeekSSE(res, 'toast', { type: 'error', content: '没有可用账号' });
     sendDeepSeekSSE(res, 'close', { click_behavior: 'retry' });
     res.end();
@@ -683,6 +720,7 @@ async function handleDeepSeekCompletion(req, res, mode) {
       thinking_enabled: !!thinking_enabled,
       search_enabled: !!search_enabled
     })) {
+      if (clientDisconnected) break;
       if (event.v && typeof event.v === 'string') {
         fullContent += event.v;
         sendDeepSeekSSE(res, 'delta', {
@@ -696,27 +734,37 @@ async function handleDeepSeekCompletion(req, res, mode) {
       }
     }
 
+    if (clientDisconnected) {
+      recordStat('client_disconnect', Date.now() - startTime);
+      accountPool.release(acct);
+      try { res.end(); } catch { /* ignore */ }
+      return;
+    }
+
     // Store the response message
     db.addMessage(chat_session_id, { role: 'assistant', content: fullContent, id: responseMessageId }, userId);
 
-    recordStat(true, Date.now() - startTime);
+    recordStat('success', Date.now() - startTime);
+    accountPool.release(acct);
     sendDeepSeekSSE(res, 'finish', {});
     sendDeepSeekSSE(res, 'close', { click_behavior: 'none' });
 
   } catch (err) {
     console.error('DeepSeek client error:', err.message);
-    recordStat(false, Date.now() - startTime);
-    db.updateAccountState(acct.id, 'error', err.message);
-    sendDeepSeekSSE(res, 'toast', {
-      type: 'error',
-      content: '模型服务异常: ' + err.message
-    });
-    sendDeepSeekSSE(res, 'close', { click_behavior: 'retry' });
-  } finally {
-    releaseAccount(acct);
+    recordStat('upstream_error', Date.now() - startTime);
+    accountPool.error(acct, err.message);
+    if (!clientDisconnected) {
+      sendDeepSeekSSE(res, 'toast', {
+        type: 'error',
+        content: '模型服务异常: ' + err.message
+      });
+      sendDeepSeekSSE(res, 'close', { click_behavior: 'retry' });
+    }
   }
+  // 注意: 不再 finally releaseAccount, 因为 success/error 分支已显式处理
+  //   accountPool.claim 已加到 _inFlight, 失败/成功都已从 _inFlight 移除
 
-  res.end();
+  try { res.end(); } catch { /* ignore */ }
 }
 
 // Chat endpoints

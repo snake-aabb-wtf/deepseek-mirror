@@ -9,6 +9,7 @@ const express = require('express');
 const session = require('express-session');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
 const { createProxyMiddleware } = require('http-proxy-middleware');
 const path = require('path');
 const crypto = require('crypto');
@@ -16,15 +17,16 @@ const db = require('./db');
 const DeepSeekClient = require('./deepseek-client');
 const { AdminTokenStore } = require('./lib/admin-tokens');
 const { AccountPool } = require('./lib/account-pool');
+const { logger } = require('./lib/logger');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
 // [PR-0.3] SESSION_SECRET 未配置时拒绝启动（fail-fast）
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
-  console.error('[FATAL] SESSION_SECRET environment variable is required (>= 32 chars).');
-  console.error('  Set it in .env or shell, e.g.:');
-  console.error('    node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))" | (read SECRET; echo "SESSION_SECRET=$SECRET" >> .env)');
+  logger.fatal('SESSION_SECRET environment variable is required (>= 32 chars).');
+  logger.fatal('  Set it in .env or shell, e.g.:');
+  logger.fatal("    node -e \"console.log(require('crypto').randomBytes(48).toString('hex'))\" | (read SECRET; echo \"SESSION_SECRET=$SECRET\" >> .env)");
   process.exit(1);
 }
 
@@ -92,10 +94,10 @@ function recordStat(outcome, latencyMs) {
 
 // [PR-0.10] 顶层错误处理
 process.on('unhandledRejection', (reason) => {
-  console.error('[unhandledRejection]', reason);
+  logger.error({ err: reason }, 'unhandledRejection');
 });
 process.on('uncaughtException', (err) => {
-  console.error('[uncaughtException]', err);
+  logger.error({ err }, 'uncaughtException');
   // 优雅退出，让进程管理器拉起
   setTimeout(() => process.exit(1), 200);
 });
@@ -132,6 +134,7 @@ app.use(session({
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use(cookieParser());  // [PR-4.1] 解析 cookie 给 adminAuth 用
 
 // [PR-0.7] 限流：登录/注册
 const authLimiter = rateLimit({
@@ -191,7 +194,7 @@ app.post('/sign_in', authLimiter, (req, res) => {
     //     这里用 saveUninitialized:false 配合显式 save 确保 Set-Cookie 被发送。
     req.session.regenerate((err) => {
       if (err) {
-        console.error('session.regenerate error:', err);
+        logger.error({ err }, 'session.regenerate error');
         return res.status(500).send('Session error');
       }
       req.session.authenticated = true;
@@ -200,7 +203,7 @@ app.post('/sign_in', authLimiter, (req, res) => {
       req.flash('ok', '登录成功');
       req.session.save((saveErr) => {
         if (saveErr) {
-          console.error('session.save error:', saveErr);
+          logger.error({ err: saveErr }, 'session.save error');
           return res.status(500).send('Session error');
         }
         // 兜底：某些中间件顺序下 express-session 的 onHeaders 不发 Set-Cookie
@@ -222,7 +225,7 @@ app.post('/sign_in', authLimiter, (req, res) => {
     return;
   }
   req.flash('err', '账号或密码错误');
-  res.redirect('/sign_in');
+  res.redirect('/sign_in?flash=err&msg=' + encodeURIComponent('账号或密码错误'));
 });
 
 app.post('/api/logout', (req, res) => {
@@ -256,8 +259,7 @@ app.post('/sign_up', authLimiter, (req, res) => {
   const { username, password, confirm_password } = req.body || {};
   // [PR-0.8] 统一错误提示，防用户名/密码策略枚举
   const fail = (msg) => {
-    req.flash('err', msg);
-    res.redirect('/sign_up');
+    res.redirect('/sign_up?flash=err&msg=' + encodeURIComponent(msg));
   };
   if (!isValidUsername(username)) return fail('注册失败：用户名需 3-32 位字母/数字/下划线/连字符');
   if (!isStrongPassword(password)) return fail('注册失败：密码至少 10 位且包含大小写字母和数字');
@@ -265,15 +267,22 @@ app.post('/sign_up', authLimiter, (req, res) => {
   if (db.getUserByUsername(username)) return fail('注册失败：用户名已存在');
   const user = db.createUser(username, password);
   if (!user) return fail('注册失败：服务器错误，请重试');
-  req.flash('ok', '注册成功，请登录');
-  res.redirect('/sign_in');
+  res.redirect('/sign_in?flash=ok&msg=' + encodeURIComponent('注册成功，请登录'));
 });
 
 // ── Admin auth middleware ────────────────────────────────────
+// [PR-4.1] 鉴权 token 改 httpOnly cookie (防 XSS 窃取)
+// 客户端用 credentials: 'include' 自动带 cookie
 function adminAuth(req, res, next) {
-  const auth = req.headers.authorization || '';
-  const token = auth.replace(/^Bearer\s+/, '').trim();
-  if (ADMIN_TOKENS.has(token)) return next();
+  // 优先 cookie；为兼容旧脚本，仍接受 Authorization: Bearer
+  let token = null;
+  if (req.cookies && req.cookies.ds_admin) {
+    token = req.cookies.ds_admin;
+  } else {
+    const auth = req.headers.authorization || '';
+    token = auth.replace(/^Bearer\s+/, '').trim();
+  }
+  if (token && ADMIN_TOKENS.has(token)) return next();
   res.status(401).json({ detail: 'Unauthorized' });
 }
 
@@ -291,7 +300,23 @@ app.post('/admin/api/login', authLimiter, (req, res) => {
     return res.status(403).json({ detail: 'Invalid credentials' });
   }
   const token = ADMIN_TOKENS.issue();
-  res.json({ token });
+  // [PR-4.1] 设置 httpOnly cookie
+  res.cookie('ds_admin', token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE !== 'false',
+    sameSite: 'strict',
+    maxAge: 8 * 60 * 60 * 1000,  // 8h，与 token TTL 一致
+    path: '/admin',
+  });
+  res.json({ ok: true, token });  // token 保留用于兼容（也可省略）
+});
+
+// [PR-4.1] 登出端点
+app.post('/admin/api/logout', adminAuth, (req, res) => {
+  const token = req.cookies?.ds_admin;
+  if (token) ADMIN_TOKENS.revoke(token);
+  res.clearCookie('ds_admin', { path: '/admin' });
+  res.json({ ok: true });
 });
 
 app.get('/admin/api/stats', adminLimiter, adminAuth, (req, res) => {
@@ -407,6 +432,10 @@ app.use((req, res, next) => {
   }
   if (req.path === '/sign_in' || req.path.startsWith('/sign_in/') ||
       req.path === '/sign_up' || req.path.startsWith('/sign_up/')) {
+    return next();
+  }
+  // [PR-4.5] auth.css 等公共资源白名单
+  if (req.path === '/auth.css' || req.path.startsWith('/favicon')) {
     return next();
   }
   if (req.path === '/') {
@@ -750,7 +779,7 @@ async function handleDeepSeekCompletion(req, res, mode) {
     sendDeepSeekSSE(res, 'close', { click_behavior: 'none' });
 
   } catch (err) {
-    console.error('DeepSeek client error:', err.message);
+    logger.error({ err: err.message, acctId: acct.id }, 'DeepSeek client error');
     recordStat('upstream_error', Date.now() - startTime);
     accountPool.error(acct, err.message);
     if (!clientDisconnected) {
@@ -830,17 +859,14 @@ app.get('*', (req, res) => {
 async function start() {
   await db.init();
   app.listen(PORT, () => {
-    console.log(`DeepSeek Mirror running at http://localhost:${PORT}`);
-    console.log(`Admin panel: http://localhost:${PORT}/admin/`);
-    console.log(`NODE_ENV=${process.env.NODE_ENV}`);
+    logger.info({ port: PORT }, `DeepSeek Mirror running at http://localhost:${PORT}`);
+    logger.info({ adminUrl: `http://localhost:${PORT}/admin/` }, 'Admin panel ready');
     if (ADMIN_BOOT.generated) {
-      console.log('');
-      console.log('============================================================');
-      console.log(' [PR-0.4] 临时管理员凭据已生成（请保存，下次启动不再显示）');
-      console.log(`   用户名: ${ADMIN_USERNAME}`);
-      console.log(`   密  码: ${ADMIN_PASSWORD}`);
-      console.log(' 建议在 .env 中设置 ADMIN_USERNAME / ADMIN_PASSWORD 永久化。');
-      console.log('============================================================');
+      logger.warn('============================================================');
+      logger.warn(' [PR-0.4] 临时管理员凭据已生成（请保存，下次启动不再显示）');
+      logger.warn({ username: ADMIN_USERNAME, password: ADMIN_PASSWORD });
+      logger.warn(' 建议在 .env 中设置 ADMIN_USERNAME / ADMIN_PASSWORD 永久化。');
+      logger.warn('============================================================');
     }
   });
 }

@@ -101,10 +101,22 @@ DeepSeek Mirror 是一个自托管的 DeepSeek Chat 镜像站，将 `chat.deepse
 ### 开发环境搭建
 
 ```bash
-cd D:\新建文件夹\bps-research\deepseek\镜像站
+# 1. 进入项目目录（路径以你的实际位置为准）
+cd deepseek-mirror
+
+# 2. 复制 .env.example 为 .env，并填入 SESSION_SECRET 与 DB_ENCRYPT_KEY
+cp .env.example .env
+# 生成密钥：
+#   node -e "console.log('SESSION_SECRET=' + require('crypto').randomBytes(48).toString('hex'))"
+#   node -e "console.log('DB_ENCRYPT_KEY=' + require('crypto').randomBytes(32).toString('hex'))"
+
+# 3. 安装依赖（需要 Node 20+）
 npm install
+
+# 4. 启动
 node server.js
 # 访问 http://localhost:3000
+# Admin: http://localhost:3000/admin/
 ```
 
 ---

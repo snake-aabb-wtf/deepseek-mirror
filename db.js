@@ -15,6 +15,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const Database = require('better-sqlite3');
 const { encryptToken, decryptToken, looksEncrypted } = require('./lib/crypto');
+const { createLogger } = require('./lib/logger');
+const logger = createLogger('db');
 
 const DB_PATH = path.join(__dirname, 'sessions.db');
 const OLD_DB_PATH = path.join(__dirname, 'sessions.db.old');  // 迁移后保留原文件
@@ -45,7 +47,7 @@ async function init() {
         try {
           migrateFromSqlJs(old);
         } catch (e) {
-          console.error('[migrate] failed:', e.message);
+          logger.error({ err: e.message }, '[migrate] failed');
         }
       }
     }
@@ -202,7 +204,7 @@ function findOldSqlJsDb() {
 }
 
 function migrateFromSqlJs(oldPath) {
-  console.log(`[migrate] found legacy DB: ${oldPath}`);
+  logger.info({ path: oldPath }, '[migrate] found legacy DB');
   let oldDb;
   try {
     const initSqlJs = require('sql.js');
@@ -219,10 +221,10 @@ function migrateFromSqlJs(oldPath) {
       doMigrate(oldDb);
       // 把旧 db 重命名（不删除，让用户手动确认）
       fs.renameSync(oldPath, OLD_DB_PATH);
-      console.log(`[migrate] done, old DB moved to ${OLD_DB_PATH}`);
+      logger.info({ path: OLD_DB_PATH }, '[migrate] done');
     });
   } catch (e) {
-    console.error('[migrate] error:', e.message);
+    logger.error({ err: e.message }, '[migrate] error');
   }
 }
 
@@ -241,9 +243,9 @@ function doMigrate(oldDb) {
         );
       });
       txn(rows[0].values);
-      console.log(`[migrate] sessions: ${rows[0].values.length}`);
+      logger.info({ count: rows[0].values.length }, '[migrate] sessions');
     }
-  } catch (e) { console.error('[migrate] sessions error:', e.message); }
+  } catch (e) { logger.error({ err: e.message }, '[migrate] sessions error'); }
 
   // messages
   try {
@@ -257,9 +259,9 @@ function doMigrate(oldDb) {
         for (const r of rs) insert.run(r[0], r[1], r[2], r[3] || '', r[4] || 0);
       });
       txn(rows[0].values);
-      console.log(`[migrate] messages: ${rows[0].values.length}`);
+      logger.info({ count: rows[0].values.length }, '[migrate] messages');
     }
-  } catch (e) { console.error('[migrate] messages error:', e.message); }
+  } catch (e) { logger.error({ err: e.message }, '[migrate] messages error'); }
 
   // users
   try {
@@ -272,9 +274,9 @@ function doMigrate(oldDb) {
         for (const r of rs) insert.run(r[0], r[1], r[2], r[3] || 0);
       });
       txn(rows[0].values);
-      console.log(`[migrate] users: ${rows[0].values.length}`);
+      logger.info({ count: rows[0].values.length }, '[migrate] users');
     }
-  } catch (e) { console.error('[migrate] users error:', e.message); }
+  } catch (e) { logger.error({ err: e.message }, '[migrate] users error'); }
 
   // accounts (加密)
   try {
@@ -300,9 +302,9 @@ function doMigrate(oldDb) {
         }
       });
       txn(rows[0].values);
-      console.log(`[migrate] accounts: ${rows[0].values.length} (encrypted)`);
+      logger.info({ count: rows[0].values.length }, '[migrate] accounts (encrypted)');
     }
-  } catch (e) { console.error('[migrate] accounts error:', e.message); }
+  } catch (e) { logger.error({ err: e.message }, '[migrate] accounts error'); }
 }
 
 // ── 公开 API：sessions ─────────────────────────────────────────

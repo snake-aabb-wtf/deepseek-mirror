@@ -1,5 +1,7 @@
-// admin/app.js — PR-3 改进
+// admin/app.js — PR-4 改进
 // 修复：
+//   - [PR-4.1] admin 鉴权改 httpOnly cookie (credentials: 'include')
+//              移除 localStorage 存储，防御 XSS
 //   - [PR-3.6] setInterval 泄漏：返回 cleanup 函数，render() 调用上一个 cleanup
 //   - [PR-3.6] 5s 轮询竞态：generation + inFlight 标志
 //   - [PR-3.3] 账号 API 从 :index 改为 :id
@@ -8,27 +10,21 @@
 //   - 错误消息用 textContent 替代 innerHTML
 
 const STATE = {
-  token: localStorage.getItem("admin_token") || null,
+  // [PR-4.1] 不再 localStorage 存 token；用 httpOnly cookie
   view: "dashboard",
   cleanup: null,  // 当前页面的 cleanup 函数
 };
 
-function setToken(t) {
-  STATE.token = t;
-  if (t) localStorage.setItem("admin_token", t);
-  else localStorage.removeItem("admin_token");
-}
-
-function authHeader() {
-  return STATE.token ? { "Authorization": `Bearer ${STATE.token}` } : {};
-}
+function authHeader() { return {}; }  // [PR-4.1] 已废：cookie 自动带
 
 async function api(path, opts = {}) {
+  // [PR-4.1] credentials: 'include' 带上 httpOnly cookie
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...authHeader(), ...opts.headers },
+    credentials: "include",
+    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
     ...opts,
   });
-  if (res.status === 401) { setToken(null); render(); throw new Error("未授权"); }
+  if (res.status === 401) { STATE.loggedIn = false; render(); throw new Error("未授权"); }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
     throw new Error(body.detail || `HTTP ${res.status}`);
@@ -78,7 +74,7 @@ function render() {
   }
 
   const app = document.getElementById("app");
-  if (!STATE.token) {
+  if (!STATE.loggedIn) {
     app.innerHTML = renderLogin();
     attachLogin();
     return;
@@ -118,7 +114,12 @@ function renderLayout() {
   <main class="main" id="page-content"></main>`;
 }
 
-function logout() { setToken(null); render(); }
+async function logout() {
+  // [PR-4.1] 调 /admin/api/logout 清除 cookie
+  try { await api("/admin/api/logout", { method: "POST" }); } catch { /* ignore */ }
+  STATE.loggedIn = false;
+  render();
+}
 
 function renderLogin() {
   return `<div class="login-page">
@@ -159,10 +160,11 @@ function attachLogin() {
     btn.disabled = true;
     btn.textContent = "登录中…";
     try {
-      const res = await api("/admin/api/login", {
+      await api("/admin/api/login", {
         method: "POST", body: JSON.stringify({ username: usr, password: pwd }),
       });
-      setToken(res.token);
+      // [PR-4.1] cookie 已由服务端 Set-Cookie 写入
+      STATE.loggedIn = true;
       render();
     } catch (e) {
       setLoginError(e.message);
@@ -395,4 +397,14 @@ function esc(s) {
   return d.innerHTML;
 }
 
-render();
+// [PR-4.1] 启动时探测登录态: 调 /admin/api/stats 一次
+// 成功 -> 已登录; 401 -> 未登录
+(async function bootstrap() {
+  try {
+    await api("/admin/api/stats");
+    STATE.loggedIn = true;
+  } catch {
+    STATE.loggedIn = false;
+  }
+  render();
+})();

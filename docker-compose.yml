@@ -1,0 +1,47 @@
+# docker-compose.yml — PR-5.7
+# 一键启动 + 持久化
+#
+# 用法:
+#   cp .env.example .env  # 填入 SESSION_SECRET / DB_ENCRYPT_KEY
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose down
+
+services:
+  mirror:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: deepseek-mirror:latest
+    container_name: deepseek-mirror
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - LOG_LEVEL=info
+      - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET is required}
+      - DB_ENCRYPT_KEY=${DB_ENCRYPT_KEY:?DB_ENCRYPT_KEY is required}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - DB_PATH=/app/data/sessions.db
+    volumes:
+      # 持久化 SQLite
+      - mirror-data:/app/data
+      # .env 不可挂载（已通过 environment 注入）
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/auth.css', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  mirror-data:
+    driver: local

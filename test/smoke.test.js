@@ -345,4 +345,13 @@ describe('HTTP 端点', () => {
     }
     assert.ok(codes.includes(429), 'should have at least one 429 in 12 attempts, got: ' + codes.join(','));
   });
+
+  test('GET /metrics Prometheus 格式', async () => {
+    const res = await request('GET', '/metrics');
+    assert.equal(res.status, 200);
+    assert.match(res.headers['content-type'], /text\/plain/);
+    assert.match(res.body, /# HELP ds_mirror_requests_total/);
+    assert.match(res.body, /ds_mirror_requests_total \d+/);
+    assert.match(res.body, /ds_mirror_accounts\{state="total"\} \d+/);
+  });
 });

@@ -335,6 +335,44 @@ app.get('/admin/api/stats', adminLimiter, adminAuth, (req, res) => {
   });
 });
 
+// [PR-5.9] Prometheus metrics 端点（公开，无需 admin 鉴权 — 内部抓取）
+app.get('/metrics', (req, res) => {
+  const acctStats = db.getAccountStats();
+  const lines = [];
+  const escape = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
+  const help = (name, type, help) => lines.push(`# HELP ${name} ${help}\n# TYPE ${name} ${type}`);
+  const metric = (name, value, labels) => {
+    const l = labels ? '{' + Object.entries(labels).map(([k, v]) => `${k}="${escape(v)}"`).join(',') + '}' : '';
+    lines.push(`${name}${l} ${value}`);
+  };
+
+  help('ds_mirror_requests_total', 'counter', 'Total chat requests');
+  metric('ds_mirror_requests_total', stats.total_requests);
+  metric('ds_mirror_requests_success', stats.success_requests);
+  metric('ds_mirror_requests_failed', stats.failed_requests);
+  metric('ds_mirror_requests_no_account', stats.no_account_requests);
+  metric('ds_mirror_requests_upstream_error', stats.upstream_errors);
+  metric('ds_mirror_requests_client_disconnect', stats.client_disconnects);
+
+  help('ds_mirror_latency_ms', 'gauge', 'Average request latency in ms');
+  metric('ds_mirror_latency_ms', stats.total_requests > 0 ? Math.round(stats.total_latency_ms / stats.total_requests) : 0);
+
+  help('ds_mirror_uptime_seconds', 'gauge', 'Process uptime in seconds');
+  metric('ds_mirror_uptime_seconds', Math.floor((Date.now() - stats.start_time) / 1000));
+
+  help('ds_mirror_accounts', 'gauge', 'Account pool stats by state');
+  metric('ds_mirror_accounts', acctStats.total || 0, { state: 'total' });
+  metric('ds_mirror_accounts', acctStats.idle || 0, { state: 'idle' });
+  metric('ds_mirror_accounts', acctStats.busy || 0, { state: 'busy' });
+  metric('ds_mirror_accounts', acctStats.error || 0, { state: 'error' });
+
+  help('ds_mirror_admin_tokens_active', 'gauge', 'Active admin tokens');
+  metric('ds_mirror_admin_tokens_active', ADMIN_TOKENS.size());
+
+  res.set('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+  res.send(lines.join('\n') + '\n');
+});
+
 app.get('/admin/api/accounts', adminLimiter, adminAuth, (req, res) => {
   const all = db.getAllAccounts();
   res.json({
@@ -438,6 +476,10 @@ app.use((req, res, next) => {
   if (req.path === '/auth.css' || req.path.startsWith('/favicon')) {
     return next();
   }
+  // [PR-5.9] /metrics 公开（Prometheus 内部抓取）
+  if (req.path === '/metrics') {
+    return next();
+  }
   if (req.path === '/') {
     return res.redirect('/sign_in');
   }
@@ -448,7 +490,9 @@ app.use((req, res, next) => {
 });
 
 // Mock user API
-app.get('/api/v0/users*', (req, res) => {
+// [PR-5.2] express 5 + path-to-regexp@8 不再支持裸 * 通配符
+//   改用 {*path} 命名通配（path 必须显式命名）
+app.get('/api/v0/users{/*path}', (req, res) => {
   if (!req.session.authenticated) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
@@ -852,7 +896,8 @@ app.use(express.static(path.join(__dirname, 'public'), {
   }
 }));
 
-app.get('*', (req, res) => {
+// [PR-5.2] express 5 + path-to-regexp@8 命名通配
+app.get('/{*path}', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 

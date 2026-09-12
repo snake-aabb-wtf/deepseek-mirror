@@ -135,6 +135,7 @@ class DeepSeekClient {
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
         lastErr = new Error(`PoW challenge HTTP ${resp.status}: ${errText.slice(0, 200)}`);
+        lastErr.status = resp.status;
         continue;
       }
 
@@ -183,7 +184,9 @@ class DeepSeekClient {
 
     if (!resp.ok) {
       const errText = await resp.text().catch(() => '');
-      throw new Error(`createSession HTTP ${resp.status}: ${errText.slice(0, 200)}`);
+      const err = new Error(`createSession HTTP ${resp.status}: ${errText.slice(0, 200)}`);
+      err.status = resp.status;
+      throw err;
     }
 
     const data = await resp.json();
@@ -199,6 +202,7 @@ class DeepSeekClient {
       model_type = 'deepseek-chat',
       thinking_enabled = false,
       search_enabled = false,
+      parent_message_id = null,
     } = options;
 
     // 专家模式（thinking）可能更久 → 更长 idle timeout
@@ -208,7 +212,7 @@ class DeepSeekClient {
 
     const body = {
       chat_session_id: sessionId,
-      parent_message_id: null,
+      parent_message_id,
       model_type,
       prompt,
       ref_file_ids: [],
@@ -230,7 +234,9 @@ class DeepSeekClient {
       resp = await response;
       if (!resp.ok) {
         const errText = await resp.text().catch(() => '');
-        throw new Error(`DeepSeek API HTTP ${resp.status}: ${errText.slice(0, 200)}`);
+        const err = new Error(`DeepSeek API HTTP ${resp.status}: ${errText.slice(0, 200)}`);
+        err.status = resp.status;
+        throw err;
       }
       if (!resp.body) throw new Error('DeepSeek API: empty response body');
 
@@ -250,10 +256,14 @@ class DeepSeekClient {
         if (done) {
           // 冲刷残余
           buffer += decoder.decode();
-          break;
+          if (!buffer) break;
+          // Parse a final event even when the upstream omits the trailing
+          // newline required by the usual SSE framing.
+          buffer += '\n';
+        } else {
+          abort.reset();
+          buffer += decoder.decode(value, { stream: true });
         }
-        abort.reset();
-        buffer += decoder.decode(value, { stream: true });
 
         // [PR-2.6] buffer 上限保护
         if (buffer.length > SSE_BUFFER_LIMIT) {

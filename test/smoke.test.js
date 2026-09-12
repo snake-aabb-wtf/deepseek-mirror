@@ -41,6 +41,8 @@ before(async () => {
       DB_ENCRYPT_KEY,
       PORT: String(TEST_PORT),
       NODE_ENV: 'test',
+      ADMIN_USERNAME: 'admin',
+      ADMIN_PASSWORD: 'AdminPass1-test-password',
       LOG_LEVEL: 'info',  // 需看到 'running at' 标记才认为启动成功
       DB_PATH: TEST_DB,
     },
@@ -223,6 +225,22 @@ describe('db.js 加密账号存储', () => {
     assert.equal(target.token, 'plaintext-secret-XYZ');
     assert.equal(target.cookies, 'plaintext-cookies-XYZ');
   });
+
+  test('删除会话必须校验所属用户', () => {
+    const sessionId = '11111111-1111-4111-8111-111111111111';
+    db.createSession(sessionId, 'user-a');
+    db.addMessage(sessionId, { role: 'user', content: 'private' }, 'user-a');
+    assert.equal(db.deleteSession(sessionId, 'user-b'), false);
+    assert.equal(db.getMessages(sessionId, 'user-a').length, 1);
+    assert.equal(db.deleteSession(sessionId, 'user-a'), true);
+  });
+
+  test('不能向其他用户的会话写入消息', () => {
+    const sessionId = '22222222-2222-4222-8222-222222222222';
+    db.createSession(sessionId, 'user-a');
+    assert.throws(() => db.addMessage(sessionId, { role: 'user', content: 'forbidden' }, 'user-b'));
+    db.deleteSession(sessionId, 'user-a');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────
@@ -268,6 +286,15 @@ describe('lib/account-pool 原子性', () => {
 // 6. HTTP 端点
 // ─────────────────────────────────────────────────────────────
 describe('HTTP 端点', () => {
+  let userCookie = null;
+
+  test('没有 Session 时 mirror-bypass 不能访问 API', async () => {
+    const res = await request('POST', '/api/v0/chat_session/create', {
+      headers: { Authorization: 'Bearer mirror-bypass' },
+    });
+    assert.equal(res.status, 401);
+  });
+
   test('GET / 未登录应重定向到 /sign_in', async () => {
     const res = await request('GET', '/');
     assert.equal(res.status, 302);
@@ -303,6 +330,28 @@ describe('HTTP 端点', () => {
     assert.match(res.headers.location, /\/sign_in/);
   });
 
+  test('登录后签发的 mirror token 可验证且绑定用户', async () => {
+    const login = await request('POST', '/sign_in', {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'username=ciuser&password=Abcdefgh1Xyz',
+    });
+    assert.equal(login.status, 302);
+    userCookie = getCookie(login, 'ds.sid');
+    assert.ok(userCookie);
+
+    const current = await request('GET', '/api/v0/current', {
+      headers: { Cookie: `ds.sid=${userCookie}` },
+    });
+    assert.equal(current.status, 200);
+    const token = current.json?.data?.biz_data?.token;
+    assert.match(token, /^mirror-[0-9a-f-]+\.\d+\.[A-Za-z0-9_-]+$/i);
+
+    const tokenOnly = await request('GET', '/api/v0/current', {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(tokenOnly.status, 200);
+  });
+
   test('POST /admin/api/login 错误密码 403', async () => {
     const res = await request('POST', '/admin/api/login', {
       body: { username: 'admin', password: 'wrong' },
@@ -311,11 +360,11 @@ describe('HTTP 端点', () => {
   });
 
   test('POST /admin/api/login 正确密码 200 + Set-Cookie', async () => {
-    // 从 server 启动日志提取 admin pwd 较复杂, 这里直接读 server stdout
-    // 简化: 触发 startup 阶段 ADMIN_BOOT 的输出
-    // 因为无法跨进程获取, 改为查 .env 或测试特定 env
-    // 跳过此 test, 实际 CI 用 startup log 验证
-    // 替代: 验证 Set-Cookie 存在性
+    const res = await request('POST', '/admin/api/login', {
+      body: { username: 'admin', password: 'AdminPass1-test-password' },
+    });
+    assert.equal(res.status, 200);
+    assert.ok(getCookie(res, 'ds_admin'));
   });
 
   test('GET /admin/api/stats 无 cookie 应 401', async () => {

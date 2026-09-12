@@ -4,7 +4,7 @@
 # 用法:
 #   docker build -t deepseek-mirror .
 #   docker run -d --name ds-mirror -p 3000:3000 \
-#     -v $(pwd)/sessions.db:/app/sessions.db \
+#     -v $(pwd)/data:/app/data \
 #     -v $(pwd)/.env:/app/.env:ro \
 #     deepseek-mirror
 #

@@ -26,7 +26,12 @@ const PORT = parseInt(process.env.PORT, 10) || 3000;
 if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
   logger.fatal('SESSION_SECRET environment variable is required (>= 32 chars).');
   logger.fatal('  Set it in .env or shell, e.g.:');
-  logger.fatal("    node -e \"console.log(require('crypto').randomBytes(48).toString('hex'))\" | (read SECRET; echo \"SESSION_SECRET=$SECRET\" >> .env)");
+  logger.fatal('  Set SESSION_SECRET in .env or the shell before starting.');
+  process.exit(1);
+}
+
+if (!process.env.DB_ENCRYPT_KEY || process.env.DB_ENCRYPT_KEY.length < 32) {
+  logger.fatal('DB_ENCRYPT_KEY environment variable is required (>= 32 chars).');
   process.exit(1);
 }
 
@@ -51,6 +56,40 @@ const ADMIN_BOOT = ensureAdminDefaults();
 const ADMIN_USERNAME = ADMIN_BOOT.username;
 const ADMIN_PASSWORD = ADMIN_BOOT.password;
 const ADMIN_TOKENS = new AdminTokenStore();
+
+const MIRROR_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const USER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function issueMirrorToken(userId) {
+  const expiresAt = Date.now() + MIRROR_TOKEN_TTL_MS;
+  const payload = `${userId}.${expiresAt}`;
+  const signature = crypto.createHmac('sha256', process.env.SESSION_SECRET)
+    .update(payload)
+    .digest('base64url');
+  return `mirror-${payload}.${signature}`;
+}
+
+function verifyMirrorToken(token) {
+  if (!token || !token.startsWith('mirror-')) return null;
+  const value = token.slice('mirror-'.length);
+  const sigSeparator = value.lastIndexOf('.');
+  if (sigSeparator <= 0) return null;
+  const payload = value.slice(0, sigSeparator);
+  const signature = value.slice(sigSeparator + 1);
+  const parts = payload.split('.');
+  if (parts.length !== 2 || !USER_ID_RE.test(parts[0])) return null;
+  const expiresAt = Number(parts[1]);
+  if (!Number.isSafeInteger(expiresAt) || expiresAt <= Date.now()) return null;
+  const expected = crypto.createHmac('sha256', process.env.SESSION_SECRET)
+    .update(payload)
+    .digest('base64url');
+  const actualBuf = Buffer.from(signature);
+  const expectedBuf = Buffer.from(expected);
+  if (actualBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(actualBuf, expectedBuf)) {
+    return null;
+  }
+  return parts[0];
+}
 
 // ── Account pool ─────────────────────────────────────────────
 // Persisted in SQLite via db.js
@@ -127,7 +166,7 @@ app.use(session({
   cookie: {
     maxAge: 24 * 60 * 60 * 1000,
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE !== 'false',
+    secure: process.env.COOKIE_SECURE === 'true',
     sameSite: 'lax',
   },
 }));
@@ -213,7 +252,7 @@ app.post('/sign_in', authLimiter, (req, res) => {
           const cookieStr = cookieSerialize('ds.sid', 's:' + sig, {
             path: '/',
             httpOnly: true,
-            secure: false,
+            secure: process.env.COOKIE_SECURE === 'true',
             sameSite: 'lax',
             maxAge: 24 * 60 * 60,
           });
@@ -230,7 +269,11 @@ app.post('/sign_in', authLimiter, (req, res) => {
 
 app.post('/api/logout', (req, res) => {
   if (req.session) {
-    req.session.destroy(() => res.redirect('/sign_in'));
+    req.session.destroy(() => {
+      // Also remove a stateless SPA token kept in localStorage.
+      res.setHeader('Clear-Site-Data', '"storage"');
+      res.redirect('/sign_in');
+    });
   } else {
     res.redirect('/sign_in');
   }
@@ -303,7 +346,7 @@ app.post('/admin/api/login', authLimiter, (req, res) => {
   // [PR-4.1] 设置 httpOnly cookie
   res.cookie('ds_admin', token, {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production' && process.env.COOKIE_SECURE !== 'false',
+    secure: process.env.COOKIE_SECURE === 'true',
     sameSite: 'strict',
     maxAge: 8 * 60 * 60 * 1000,  // 8h，与 token TTL 一致
     path: '/admin',
@@ -451,12 +494,22 @@ app.post('/admin/api/accounts/:id/relogin', adminLimiter, adminAuth, async (req,
 
 app.use('/admin', express.static(path.join(__dirname, 'admin')));
 
-// ── Token bypass middleware (Accept SPA's Authorization header) ──
+// ── Token bridge middleware ────────────────────────────────────
+// The SPA sends a mirror token, but the token must never be an
+// unauthenticated prefix-based bypass.  The bootstrap token is only
+// accepted together with the authenticated browser session, and the
+// per-user token must match that same session's user id.
 app.use((req, res, next) => {
   const auth = req.headers.authorization || '';
-  const token = auth.replace('Bearer ', '').trim();
-  if (token && (token === 'mirror-bypass' || token.startsWith('mirror-'))) {
-    req.session.authenticated = true;
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  const session = req.session;
+  if (token === 'mirror-bypass' && session.authenticated) {
+    return next();
+  }
+  const tokenUserId = verifyMirrorToken(token);
+  if (tokenUserId) {
+    session.authenticated = true;
+    session.userId = tokenUserId;
     return next();
   }
   next();
@@ -496,6 +549,9 @@ app.get('/api/v0/users{/*path}', (req, res) => {
   if (!req.session.authenticated) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'User session is not initialized' });
+  }
   res.json({
     data: {
       biz_data: {
@@ -503,7 +559,7 @@ app.get('/api/v0/users{/*path}', (req, res) => {
         email: "mirror@localhost",
         nickname: "镜像用户",
         avatar: "",
-        token: "mirror-" + (req.session.userId || 'mirror-user'),
+        token: issueMirrorToken(req.session.userId),
         is_new_user: false,
         chat: { max_history_days: 999 },
         settings: {
@@ -520,6 +576,9 @@ app.get('/api/v0/current', (req, res) => {
   if (!req.session.authenticated) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
+  if (!req.session.userId) {
+    return res.status(401).json({ error: 'User session is not initialized' });
+  }
   res.json({
     data: {
       biz_data: {
@@ -527,7 +586,7 @@ app.get('/api/v0/current', (req, res) => {
         email: "mirror@localhost",
         nickname: "镜像用户",
         avatar: "",
-        token: "mirror-" + (req.session.userId || 'mirror-user'),
+        token: issueMirrorToken(req.session.userId),
         is_new_user: false,
         chat: { max_history_days: 999 },
         settings: {
@@ -603,7 +662,11 @@ app.post('/api/v0/chat_session/update_title', (req, res) => {
 
 app.post('/api/v0/chat_session/delete', (req, res) => {
   const { chat_session_id } = req.body;
-  if (chat_session_id) db.deleteSession(chat_session_id, uid(req));
+  if (!chat_session_id) {
+    return res.status(400).json({ error: 'Missing chat_session_id' });
+  }
+  const deleted = db.deleteSession(chat_session_id, uid(req));
+  if (!deleted) return res.status(404).json({ error: 'Session not found' });
   res.json({ data: { biz_code: 0 } });
 });
 
@@ -689,6 +752,12 @@ app.post('/api/v0/chat/create_pow_challenge', (req, res) => {
 // [PR-3.1] 原子账号池
 const accountPool = new AccountPool(db);
 
+function isCredentialError(err) {
+  const status = Number(err?.status);
+  if (status === 401 || status === 403) return true;
+  return /HTTP\s+(401|403)\b|unauthori[sz]ed|forbidden|invalid token|token expired/i.test(err?.message || '');
+}
+
 function sendDeepSeekSSE(res, event, data) {
   // [PR-3.5] 客户端断开时 res.write 会抛 EPIPE
   try {
@@ -709,23 +778,27 @@ async function handleDeepSeekCompletion(req, res, mode) {
     model_type = 'deepseek-chat',
     thinking_enabled = false,
     search_enabled = false
-  } = req.body;
+  } = req.body || {};
 
-  if (!prompt) {
+  if (typeof prompt !== 'string' || !prompt.trim()) {
     return res.status(400).json({ error: 'Missing prompt' });
+  }
+  if (prompt.length > 100_000) {
+    return res.status(413).json({ error: 'Prompt too large' });
+  }
+  if (typeof chat_session_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(chat_session_id)) {
+    return res.status(400).json({ error: 'Invalid chat_session_id' });
   }
 
   // [PR-3.2] IDOR 修复: 所有 db 操作用 userId 隔离
   const userId = uid(req);
-  if (chat_session_id) {
-    const existing = db.getSession(chat_session_id, userId);
-    if (!existing) {
-      // IDOR 防御: 不能 create 别人的 session
-      if (chat_session_id && !chat_session_id.match(/^[0-9a-f-]{36}$/i)) {
-        return res.status(400).json({ error: 'Invalid session id' });
-      }
-      db.createSession(chat_session_id, userId);
+  let localSession = db.getSession(chat_session_id, userId);
+  if (!localSession) {
+    // Never silently continue when the UUID belongs to another user.
+    if (db.getSession(chat_session_id)) {
+      return res.status(404).json({ error: 'Session not found' });
     }
+    localSession = db.createSession(chat_session_id, userId);
   }
 
   // For regenerate: remove last assistant message from DB
@@ -771,7 +844,12 @@ async function handleDeepSeekCompletion(req, res, mode) {
   const startTime = Date.now();
 
   // [PR-3.1] 用原子账号池
-  const acct = accountPool.claim();
+  // A DeepSeek upstream session belongs to the account that created it.
+  // Reuse that account for subsequent turns so conversation context survives.
+  const boundAccount = localSession.upstream_account_id
+    ? db.getAccountById(localSession.upstream_account_id)
+    : null;
+  const acct = accountPool.claim(boundAccount ? boundAccount.id : null);
   if (!acct) {
     recordStat('no_account', Date.now() - startTime);
     sendDeepSeekSSE(res, 'toast', { type: 'error', content: '没有可用账号' });
@@ -783,17 +861,26 @@ async function handleDeepSeekCompletion(req, res, mode) {
   const client = new DeepSeekClient(acct.token, acct.cookies);
 
   try {
-    // 1. Create a DeepSeek session
-    const dsSessionId = await client.createSession();
+    // 1. Reuse the upstream session for this local conversation, or create it.
+    let dsSessionId = localSession.upstream_session_id;
+    if (!dsSessionId || !boundAccount || localSession.upstream_account_id !== acct.id) {
+      dsSessionId = await client.createSession();
+      db.updateUpstreamState(chat_session_id, dsSessionId, localSession.upstream_parent_message_id, acct.id, userId);
+    }
 
     // 2. Stream response from DeepSeek
     let fullContent = '';
+    let upstreamResponseMessageId = null;
     for await (const event of client.chatStream(dsSessionId, prompt, {
       model_type,
       thinking_enabled: !!thinking_enabled,
-      search_enabled: !!search_enabled
+      search_enabled: !!search_enabled,
+      parent_message_id: localSession.upstream_parent_message_id || null,
     })) {
       if (clientDisconnected) break;
+      if (event._event === 'ready' && event.response_message_id) {
+        upstreamResponseMessageId = String(event.response_message_id);
+      }
       if (event.v && typeof event.v === 'string') {
         fullContent += event.v;
         sendDeepSeekSSE(res, 'delta', {
@@ -814,6 +901,16 @@ async function handleDeepSeekCompletion(req, res, mode) {
       return;
     }
 
+    if (upstreamResponseMessageId) {
+      db.updateUpstreamState(
+        chat_session_id,
+        dsSessionId,
+        upstreamResponseMessageId,
+        acct.id,
+        userId
+      );
+    }
+
     // Store the response message
     db.addMessage(chat_session_id, { role: 'assistant', content: fullContent, id: responseMessageId }, userId);
 
@@ -825,7 +922,13 @@ async function handleDeepSeekCompletion(req, res, mode) {
   } catch (err) {
     logger.error({ err: err.message, acctId: acct.id }, 'DeepSeek client error');
     recordStat('upstream_error', Date.now() - startTime);
-    accountPool.error(acct, err.message);
+    if (isCredentialError(err)) {
+      accountPool.error(acct, err.message);
+    } else {
+      // Transient upstream/network/protocol errors must not permanently
+      // poison an otherwise healthy account.
+      accountPool.release(acct);
+    }
     if (!clientDisconnected) {
       sendDeepSeekSSE(res, 'toast', {
         type: 'error',

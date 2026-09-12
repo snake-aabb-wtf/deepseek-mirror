@@ -20,7 +20,8 @@
     "express-session": "1.19.0",
     "helmet": "8.2.0",
     "http-proxy-middleware": "2.0.10",
-    "pino": "9.14.0"
+    "pino": "9.14.0",
+    "sql.js": "1.14.1"
   },
   "devDependencies": {
     "pino-pretty": "11.3.0"

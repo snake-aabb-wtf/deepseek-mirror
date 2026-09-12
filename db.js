@@ -19,7 +19,7 @@ const { createLogger } = require('./lib/logger');
 const logger = createLogger('db');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'sessions.db');
-const OLD_DB_PATH = path.join(__dirname, 'sessions.db.old');  // 迁移后保留原文件
+const OLD_DB_PATH = `${DB_PATH}.migrated`;
 
 let db = null;
 let _initPromise = null;
@@ -45,7 +45,7 @@ async function init() {
       const old = findOldSqlJsDb();
       if (old) {
         try {
-          migrateFromSqlJs(old);
+          await migrateFromSqlJs(old);
         } catch (e) {
           logger.error({ err: e.message }, '[migrate] failed');
         }
@@ -66,7 +66,10 @@ function ensureSchema() {
       pinned        INTEGER DEFAULT 0,
       model_type    TEXT DEFAULT 'deepseek-chat',
       version       INTEGER DEFAULT 1,
-      created_at    INTEGER DEFAULT 0
+      created_at    INTEGER DEFAULT 0,
+      upstream_session_id TEXT,
+      upstream_parent_message_id TEXT,
+      upstream_account_id INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -103,6 +106,17 @@ function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS idx_accounts_state   ON accounts(state);
   `);
+
+  const sessionColumns = new Set(db.prepare('PRAGMA table_info(sessions)').all().map(c => c.name));
+  if (!sessionColumns.has('upstream_session_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN upstream_session_id TEXT');
+  }
+  if (!sessionColumns.has('upstream_parent_message_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN upstream_parent_message_id TEXT');
+  }
+  if (!sessionColumns.has('upstream_account_id')) {
+    db.exec('ALTER TABLE sessions ADD COLUMN upstream_account_id INTEGER');
+  }
 }
 
 function prepareStatements() {
@@ -128,11 +142,16 @@ function prepareStatements() {
   stmts.updatePinned = db.prepare(`
     UPDATE sessions SET pinned = ?, updated_at = ? WHERE id = ? AND user_id = ?
   `);
-  stmts.deleteSession = db.prepare('DELETE FROM messages WHERE session_id = ?');
+  stmts.deleteSession = db.prepare('DELETE FROM messages WHERE session_id = ? AND user_id = ?');
   stmts.deleteSessionRow = db.prepare('DELETE FROM sessions WHERE id = ? AND user_id = ?');
   stmts.deleteAllSessions = db.prepare('DELETE FROM messages WHERE user_id = ?');
   stmts.deleteAllSessionsMeta = db.prepare('DELETE FROM sessions WHERE user_id = ?');
   stmts.touchSession = db.prepare('UPDATE sessions SET updated_at = ? WHERE id = ? AND user_id = ?');
+  stmts.updateUpstreamState = db.prepare(`
+    UPDATE sessions
+    SET upstream_session_id = ?, upstream_parent_message_id = ?, upstream_account_id = ?
+    WHERE id = ? AND user_id = ?
+  `);
   stmts.getSessionCount = db.prepare('SELECT COUNT(*) as c FROM sessions WHERE user_id = ?');
 
   // messages
@@ -181,12 +200,20 @@ function prepareStatements() {
     )
     RETURNING *
   `);
+  stmts.claimIdleAccountById = db.prepare(`
+    UPDATE accounts SET state = 'busy', last_used = ? WHERE id = (
+      SELECT id FROM accounts WHERE id = ? AND state = 'idle'
+    )
+    RETURNING *
+  `);
 }
 
 // ── 旧 sql.js 数据库迁移 ──────────────────────────────────────
 function findOldSqlJsDb() {
   // 查找可能的 sql.js 数据库（其特征是文件大小通常 10-100KB，且包含 SQLite header）
   const candidates = [
+    `${DB_PATH}.old`,
+    `${DB_PATH}.bak`,
     path.join(__dirname, 'sessions.db.old'),
     path.join(__dirname, 'sessions.db.bak'),
   ];
@@ -203,28 +230,24 @@ function findOldSqlJsDb() {
   return null;
 }
 
-function migrateFromSqlJs(oldPath) {
+async function migrateFromSqlJs(oldPath) {
   logger.info({ path: oldPath }, '[migrate] found legacy DB');
-  let oldDb;
   try {
     const initSqlJs = require('sql.js');
-    const SQL = require('sql.js');  // already require'd
-    // sql.js 是 sync after init
     const buf = fs.readFileSync(oldPath);
-    // 重新 require 触发 init
-    delete require.cache[require.resolve('sql.js')];
-    const initSqlJs2 = require('sql.js');
-    let SQLLib;
-    return initSqlJs2().then((lib) => {
-      SQLLib = lib;
-      oldDb = new SQLLib.Database(buf);
+    const SQLLib = await initSqlJs();
+    const oldDb = new SQLLib.Database(buf);
+    try {
       doMigrate(oldDb);
-      // 把旧 db 重命名（不删除，让用户手动确认）
-      fs.renameSync(oldPath, OLD_DB_PATH);
-      logger.info({ path: OLD_DB_PATH }, '[migrate] done');
-    });
+    } finally {
+      oldDb.close();
+    }
+    // 把旧 db 重命名（不删除，让用户手动确认）
+    fs.renameSync(oldPath, OLD_DB_PATH);
+    logger.info({ path: OLD_DB_PATH }, '[migrate] done');
   } catch (e) {
     logger.error({ err: e.message }, '[migrate] error');
+    throw e;
   }
 }
 
@@ -363,8 +386,14 @@ function updatePinned(id, pinned, userId) {
 
 function deleteSession(id, userId) {
   const uid = userId || 'mirror-user';
-  stmts.deleteSession.run(id);
-  stmts.deleteSessionRow.run(id, uid);
+  const tx = db.transaction(() => {
+    const session = stmts.getSession.get(id, uid);
+    if (!session) return false;
+    stmts.deleteSession.run(id, uid);
+    stmts.deleteSessionRow.run(id, uid);
+    return true;
+  });
+  return tx();
 }
 
 function deleteAllSessions(userId) {
@@ -379,9 +408,23 @@ function touchSession(id, userId) {
   stmts.touchSession.run(now, id, uid);
 }
 
+function updateUpstreamState(id, upstreamSessionId, upstreamParentMessageId, accountId, userId) {
+  const uid = userId || 'mirror-user';
+  stmts.updateUpstreamState.run(
+    upstreamSessionId || null,
+    upstreamParentMessageId || null,
+    accountId || null,
+    id,
+    uid
+  );
+}
+
 function addMessage(sessionId, msg, userId) {
   const id = msg.id || crypto.randomUUID();
   const uid = userId || 'mirror-user';
+  if (!stmts.getSession.get(sessionId, uid)) {
+    throw new Error('Session not found or not owned by user');
+  }
   const now = Math.floor(Date.now() / 1000);
   stmts.insertMessage.run(id, sessionId, uid, msg.role, msg.content, now);
   touchSession(sessionId, uid);
@@ -516,9 +559,11 @@ function deleteAccount(id) {
   stmts.deleteAccount.run(id);
 }
 
-function claimIdleAccount() {
+function claimIdleAccount(accountId = null) {
   // PR-3 准备的原子操作
-  const row = stmts.claimIdleAccount.get(Math.floor(Date.now() / 1000));
+  const row = accountId == null
+    ? stmts.claimIdleAccount.get(Math.floor(Date.now() / 1000))
+    : stmts.claimIdleAccountById.get(Math.floor(Date.now() / 1000), accountId);
   if (!row) return null;
   return {
     id: row.id,
@@ -543,7 +588,7 @@ module.exports = {
   createSession, getSession, fetchPage,
   updateTitle, updatePinned,
   deleteSession, deleteAllSessions,
-  touchSession, addMessage, getMessages,
+  touchSession, updateUpstreamState, addMessage, getMessages,
   getSessionCount, deleteLastMessageByRole,
   // users
   createUser, getUserByUsername, verifyPassword, getUserCount,

@@ -34,6 +34,6 @@
 </head>
 <body>
 <div id="root"></div>
-<script>try{localStorage.setItem("userToken",JSON.stringify({value:"mirror-bypass",__version:"0"}))}catch(e){}</script>
+<script>try{if(!localStorage.getItem("userToken")){localStorage.setItem("userToken",JSON.stringify({value:"mirror-bypass",__version:"0"}))}}catch(e){}</script>
 </body>
 </html>
